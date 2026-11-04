@@ -147,15 +147,15 @@ function expected_schema(): array
             'password_hash'     => ['varchar(255)', false],
             'email_verified_at' => ['datetime', true],
             'status'            => ["enum('active','disabled')", false],
-            'failed_attempts'   => ['int unsigned', false],
-            'locked_until'      => ['datetime', true],
         ] + $audit,
 
         'login_attempts' => [
             'id'              => ['int unsigned', false],
-            'identifier_hash' => ['char(64)', false],
+            'scope'           => ["enum('identifier','source')", false],
+            'key_hash'        => ['char(64)', false],
             'failed_attempts' => ['int unsigned', false],
             'locked_until'    => ['datetime', true],
+            'last_failure_at' => ['datetime', true],
         ] + $audit,
 
         'categories' => [
@@ -178,6 +178,33 @@ function expected_schema(): array
         'password_resets' => $tokens,
 
         'email_verifications' => $tokens,
+
+        // The generic request throttle (issue-022 §7.2). The key is a hash:
+        // the table must never keep the address that was typed, nor the
+        // address of the connection.
+        'request_throttles' => [
+            'id'                => ['int unsigned', false],
+            'bucket'            => ['varchar(32)', false],
+            'key_hash'          => ['char(64)', false],
+            'hits'              => ['int unsigned', false],
+            'window_started_at' => ['datetime', false],
+        ] + $audit,
+
+        // The outgoing mail queue (issue-022 §7.1). The row holds personal
+        // data — a reset link lives in it until the worker sends it.
+        'mail_outbox' => [
+            'id'              => ['int unsigned', false],
+            'to_address'      => ['varchar(254)', false],
+            'subject'         => ['varchar(255)', false],
+            'body'            => ['text', false],
+            'status'          => ["enum('queued','sent','failed')", false],
+            'attempts'        => ['int unsigned', false],
+            'last_error'      => ['varchar(255)', true],
+            'claimed_at'      => ['datetime', true],
+            'created_at'      => ['datetime', false],
+            'sent_at'         => ['datetime', true],
+            'next_attempt_at' => ['datetime', true],
+        ],
     ];
 }
 
@@ -214,6 +241,12 @@ function expected_indexes(): array
         'password_resets'     => ['idx_reset_user' => ['user_id', 'expires_at']],
         'email_verifications' => ['idx_verification_user' => ['user_id', 'expires_at']],
         'login_attempts'      => ['idx_login_attempts_updated' => ['updated_at']],
+        'request_throttles'   => ['idx_request_throttles_window' => ['window_started_at']],
+        'mail_outbox'         => [
+            'idx_mail_outbox_status_created' => ['status', 'created_at'],
+            'idx_mail_outbox_claimed'        => ['claimed_at'],
+            'idx_mail_outbox_next_attempt'   => ['status', 'next_attempt_at'],
+        ],
     ];
 }
 
@@ -416,7 +449,7 @@ foreach ($statements as $statement) {
 }
 
 ok(
-    'the file creates exactly the six tables',
+    'the file creates exactly the eight tables',
     $declared === $expectedTables,
     'declared=[' . implode(', ', $declared) . '] expected=[' . implode(', ', $expectedTables) . ']'
 );
@@ -545,7 +578,7 @@ if ($pdo === null) {
     $extra   = array_values(array_diff(array_keys($tableMap), $expectedTables));
 
     ok(
-        'the database holds the six tables',
+        'the database holds the eight tables',
         $missing === [],
         'missing=[' . implode(', ', $missing) . ']'
     );
@@ -678,11 +711,14 @@ if ($pdo === null) {
         $status === null ? 'no column' : 'found ' . var_export($status['COLUMN_DEFAULT'], true)
     );
 
-    $failed = $columns['users']['failed_attempts'] ?? null;
+    // The throttle lives in login_attempts, in ONE place. The copy of the
+    // counter that used to sit on the account was never read, and a
+    // password change "cleared" it — promising an unlock it could not
+    // perform (issue-021 §6 and §8.4).
     ok(
-        'users.failed_attempts defaults to 0',
-        $failed !== null && trim((string) $failed['COLUMN_DEFAULT'], "'") === '0',
-        $failed === null ? 'no column' : 'found ' . var_export($failed['COLUMN_DEFAULT'], true)
+        'users has no throttle column any more',
+        !isset($columns['users']['failed_attempts']) && !isset($columns['users']['locked_until']),
+        'the columns are still on the account'
     );
 
     $updated = $columns['users']['updated_at'] ?? null;
@@ -718,7 +754,8 @@ if ($pdo === null) {
         'categories'          => ['uq_categories_user_name' => ['user_id', 'name']],
         'password_resets'     => ['uq_reset_token' => ['token_hash']],
         'email_verifications' => ['uq_verification_token' => ['token_hash']],
-        'login_attempts'      => ['uq_login_attempts_identifier' => ['identifier_hash']],
+        'login_attempts'      => ['uq_login_attempts_scope_key' => ['scope', 'key_hash']],
+        'request_throttles'   => ['uq_request_throttles_bucket_key' => ['bucket', 'key_hash']],
     ];
 
     foreach ($uniqueExpectations as $table => $wanted) {
@@ -749,14 +786,26 @@ if ($pdo === null) {
         'a global UNIQUE(name) would break a multi-user install'
     );
 
-    // The identifier of the throttle is stored as a hash too: the table must
-    // never keep the address that was typed at the sign-in form.
-    $identifierHash = $columns['login_attempts']['identifier_hash'] ?? null;
+    // The key of the throttle is stored as a hash too: the table must never
+    // keep the address that was typed at the sign-in form, nor the address
+    // of the connection.
+    $keyHash = $columns['login_attempts']['key_hash'] ?? null;
     ok(
-        'login_attempts.identifier_hash is CHAR(64) — the SHA-256 hash, never the identifier',
-        $identifierHash !== null
-            && strtolower((string) $identifierHash['DATA_TYPE']) === 'char'
-            && (int) $identifierHash['CHARACTER_MAXIMUM_LENGTH'] === 64
+        'login_attempts.key_hash is CHAR(64) — the SHA-256 hash, never the identifier or the address',
+        $keyHash !== null
+            && strtolower((string) $keyHash['DATA_TYPE']) === 'char'
+            && (int) $keyHash['CHARACTER_MAXIMUM_LENGTH'] === 64
+    );
+
+    // The scope says what the key is: the identifier that was typed, or the
+    // address of the connection (issue-021 §8.1).
+    $scope = $columns['login_attempts']['scope'] ?? null;
+    ok(
+        "login_attempts.scope is ENUM('identifier','source')",
+        $scope !== null
+            && strtolower((string) $scope['DATA_TYPE']) === 'enum'
+            && strtolower((string) $scope['COLUMN_TYPE']) === "enum('identifier','source')",
+        $scope === null ? 'no column' : 'found ' . (string) $scope['COLUMN_TYPE']
     );
 
     // The reset tokens are stored as a hash and a hash is unique.

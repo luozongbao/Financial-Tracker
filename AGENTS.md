@@ -8,15 +8,16 @@ This file holds only what an agent cannot infer from the tree.
 
 ## Status
 
-**Greenfield — the application code barely exists yet: only the schema, the
-core runtime, the design-token layer, the front controller, the install
-wizard, the authentication, the dashboard, the transaction, the
-categories/settings and the reports screens have been written. The development
-infrastructure and the design deliverables are complete.**
+**The application is complete and the design and DevOps tracks are complete —
+twenty of the twenty original issues are in and verified. A pre-release
+security audit (2026-10-28) and a requirement check against
+[docs/About.md](docs/About.md) produced **six further issues (021–026)**:
+**all six are in and verified**.
+Nothing in the application is a placeholder.**
 
 | Exists and works | Exists, spec only | Does not exist yet |
 |---|---|---|
-| `docker-compose.yml` (app + db + phpMyAdmin), `docker/entrypoint.sh`, `docker/mockup-nginx.conf`, `.env.example`, `.htaccess` (web-root hardening + the front-controller rewrite), `config.template.php`, `composer.json` + `composer.lock` (tracked) + `vendor/` (git-ignored), `index.php` (the front controller), `install.php` (the three-step install wizard), `includes/mailer.php`, `includes/bootstrap.php`, `includes/Database.php`, `includes/functions.php`, `includes/auth.php`, `includes/Router.php`, `includes/header.php`, `includes/footer.php`, `includes/views/` (the four error pages + the bootstrap page), `views/` (the six auth screens: login, register, forgot password, reset password, verify email, sign out) + `views/dashboard.php` + `views/transactions.php` + `views/transaction_form.php` + `views/transaction_save.php` + `views/transaction_delete.php` + `views/categories.php` + `views/category_save.php` + `views/category_delete.php` + `views/settings.php` + `views/reports.php`, `assets/css/tokens.css` + `base.css` + `components.css` + `pages/install.css` + `pages/auth.css` + `pages/dashboard.css` + `pages/transactions.css` + `pages/categories.css` + `pages/settings.css` + `pages/reports.css`, `assets/js/app.js`, `database/config_test.php`, `database/mailer_test.php`, `database/webroot_hardening_test.php`, `database/schema.sql` + `database/schema_test.php`, `database/runtime_test.php`, `database/assets_test.php`, `database/front_controller_test.php`, `database/install_test.php`, `database/auth_test.php`, `database/dashboard_test.php`, `database/transactions_test.php`, `database/categories_test.php`, `database/settings_test.php`, `database/reports_test.php`, `database/migrations/20261028_add_login_attempts.sql`, `database/live/` (the LIVE tier — the running-application sweep + the runner), `docs/mockup/` (the full design-system reference page + all twelve screen mockups + the shared `assets/` layer) | — | — |
+| `docker-compose.yml` (app + db + phpMyAdmin), `docker/entrypoint.sh`, `docker/mockup-nginx.conf`, `.env.example`, `.htaccess` (web-root hardening + the front-controller rewrite), `config.template.php`, `composer.json` + `composer.lock` (tracked) + `vendor/` (git-ignored), `index.php` (the front controller), `install.php` (the three-step install wizard), `includes/mailer.php`, `includes/bootstrap.php`, `includes/Database.php`, `includes/functions.php`, `includes/auth.php`, `includes/Router.php`, `includes/header.php`, `includes/footer.php`, `includes/views/` (the four error pages + the bootstrap page), `views/` (the six auth screens: login, register, forgot password, reset password, verify email, sign out) + `views/dashboard.php` + `views/transactions.php` + `views/transaction_form.php` + `views/transaction_save.php` + `views/transaction_delete.php` + `views/categories.php` + `views/category_save.php` + `views/category_delete.php` + `views/settings.php` + `views/reports.php`, `assets/css/tokens.css` + `base.css` + `components.css` + `pages/install.css` + `pages/auth.css` + `pages/dashboard.css` + `pages/transactions.css` + `pages/categories.css` + `pages/settings.css` + `pages/reports.css`, `assets/js/app.js`, `database/config_test.php`, `database/mailer_test.php`, `database/webroot_hardening_test.php`, `database/security_headers_test.php`, `database/css_cascade.php` (the cascade resolver the header test proves), `database/schema.sql` + `database/schema_test.php`, `database/runtime_test.php`, `database/assets_test.php`, `database/front_controller_test.php`, `database/install_test.php`, `database/auth_test.php`, `database/dashboard_test.php`, `database/transactions_test.php`, `database/categories_test.php`, `database/settings_test.php`, `database/reports_test.php`, `database/migrations/20261028_add_login_attempts.sql`, `database/migrations/20261029_throttle_scope_and_backoff.sql`, `database/migrations/20261030_mail_outbox_and_request_throttles.sql`, `includes/logging.php`, `includes/outbox.php`, `database/outbox_worker.php` (the CLI mail worker), `database/live/` (the LIVE tier — the running-application sweep + the runner), `docs/mockup/` (the full design-system reference page + all twelve screen mockups + the shared `assets/` layer), `storage/sessions/` (the private session store, mode `0700`, denied by `.htaccess`) | — | — |
 
 The DevOps track (issues 001–003, 009, 010) is **implemented and verified** —
 the stack runs **on PHP 8.5.12** (the PHP2Shell patch release), the mockup
@@ -97,8 +98,103 @@ helpers (`resolveMonthRange()`, `reportGrain()`, `reportSpanDays()`,
 `assets/css/pages/reports.css` is the stylesheet the screen needs; and
 `database/reports_test.php` guards all of it in two tiers — the sources, and a
 sandbox that runs the real screen against a scratch database. **All twenty
-issues are in.** The repository itself is still mostly greenfield — the
-remaining work is the user's own data, not more code.
+of the original issues are in.**
+
+**The sixth issue (026) is in as well** — it is the output of a requirement
+check carried out on 2026-10-28, and it closed the last gap against the
+brief. The five security findings of the audit (021–025) are all in and
+verified. Read [docs/issues/README.md](docs/issues/README.md) for the index.
+
+- **021 — the sign-in throttle is a denial-of-service weapon.** **Implemented
+  and verified.** The lockout is keyed by a hash of the identifier, the count
+  is read and written non-atomically, the `login_attempts` table grows
+  without bound, and the lock columns the schema defines are never read.
+  The throttle is now a **decaying exponential backoff** with **two**
+  counters — per identifier and per source — the effective penalty is the
+  **stricter** of the two, the increment happens **in SQL**, the account's
+  lock columns are **dropped**, the table is **pruned**, and the locked
+  screen states the wait that is really left. **The implementation found
+  one thing the audit did not**: LiteSpeed **rewrites `REMOTE_ADDR` from
+  `X-Forwarded-For`**, so the source key is built from the address that
+  really connected (`PROXY_REMOTE_ADDR`) — a bucket the visitor cannot
+  choose.
+- **022 — the registration and reset endpoints are unthrottled**, and the
+  forgot-password screen is an **account-existence oracle**. The logs also
+  carry the e-mail address and the submitted identifier. **Implemented and
+  verified.** The reset screen now answers **byte-identically** for a known
+  and an unknown address in **every** state, the mail is **queued** and sent
+  by a **CLI worker** instead of on the request path, the SMTP transport is
+  **bounded**, `/register` and `/forgot-password` are **throttled** per
+  source and per submitted address, and the log carries the **context** of a
+  failure and never the address. **The implementation found one thing the
+  audit did not**: the two limiters of the reset screen must be consulted in
+  **one** call — two calls raise the source counter for the requests the
+  address counter refused, so the window is extended by the requests that
+  were turned away.
+- **023 — the web root still serves `docker-compose.yml`**, which holds the
+  default database credentials, and `database/webroot_hardening_test.php`
+  **asserts that it does** — the test pins the leak in place. **Implemented
+  and verified.** The deny block now refuses `docker-compose.yml`,
+  `config.template.php`, `AGENTS.md` and everything under `docs/` except the
+  mockup deliverable; the hardening test no longer asserts that those paths
+  are reachable; the WebAdmin is bound to **127.0.0.1** (it was bound to every
+  interface, and the ports table said otherwise); and the floating image tags
+  are **pinned by digest**. **The implementation found one thing the audit did
+  not**: the deny list is a list of **exceptions**, so the safe form for the
+  documentation directory is a **single** rule with a **negative lookahead**
+  (`^/?docs/(?!mockup(/|$))`) — it exempts the mockup as a whole path segment
+  and refuses everything else under `docs/`, including a file added later.
+- **024 — the response headers are thin** (no CSP, no HSTS, no
+  `Permissions-Policy`), and `install.php` sends **no headers at all**.
+  **Implemented and verified.** The whole set — a strict
+  `Content-Security-Policy` with **no** `unsafe-inline` and **no** nonce, a
+  conditional `Strict-Transport-Security` and `Upgrade-Insecure-Requests`, a
+  18-feature `Permissions-Policy`, COOP, CORP and
+  `X-Permitted-Cross-Domain-Policies` — lives in **one** function,
+  `sendSecurityHeaders()`, that **both** entry points call, so the installer
+  carries the same set as the application. **The implementation found one
+  thing the audit did not**: the stack has **no browser and no JavaScript
+  engine**, and `ext-dom` here has **no `DOMElement::matches()`**, so the
+  criterion *"a computed style, not a byte count"* was **not checkable with
+  the tools that are there** — the cascade is now resolved by a hand-written
+  resolver (`database/css_cascade.php`) that **refuses** what it does not
+  understand rather than guessing. The optional `mod_headers` block of
+  issue-024 §7.3 was **removed**: the module is **not in the pinned image**,
+  measured three ways.
+- **025 — the installer writes the database and the SMTP password into the
+  session store**: a **clear-text file in the shared `/tmp`**, under a **file
+  name the client chooses**, and the session id is never rotated.
+  **Implemented and verified.** The wizard holds **no** secret at all — step 3
+  asks for the database and the SMTP password **again**, in empty fields, and
+  the state that reaches the session is stripped of both by the **one**
+  function that writes it; the session id is regenerated at the start of the
+  wizard and after every step boundary; `session.use_strict_mode` is `1`; and
+  the session files live in a private `0700` directory of the application
+  (`storage/sessions/`), not in the shared `/tmp`. **The implementation found
+  one thing the audit did not** — the regression test runs as **root** while
+  the web server runs as the application user, so a copy of the wizard created
+  by the test is a directory the web server **cannot write into**: the session
+  store could not be created, the application fell back to the shared `/tmp`,
+  and the test was about to pass while the defect it guards was live.
+- **026 — the requirement gap.** The brief says *"search and sum/average in
+  time period like day, month, weeks, year"*. The search and the sum were
+  implemented; **the average was implemented nowhere**. **Implemented and
+  verified.** The mockup moved **first** — `docs/mockup/08-reports.html` now
+  carries the "Average per" control and the average line on the three
+  tiles — and then the screen: `views/reports.php` shows the average for
+  income, spending and net, per **day**, **week**, **month** or **year**,
+  over the **calendar** denominator, divided in SQL. **The implementation
+  found one thing the issue did not**: `reportBucketExpression()` mixed the
+  config's day numbering with MariaDB's `DAYOFWEEK()`, so a week that
+  started on **Tuesday** produced a **Monday-aligned** bucket — and the
+  average's denominator is the week.
+
+The audit itself was **not** a clean bill of health on those six points and
+**is** one on everything else: the SQL injection, IDOR, XSS, CSRF, open
+redirect, session and path-traversal audits all came back clean, and the
+findings are written up with their measurements in
+[docs/issues/issue-021.md](docs/issues/issue-021.md) –
+[docs/issues/issue-026.md](docs/issues/issue-026.md). **All six are done.**
 
 Start here: **[docs/issues/README.md](docs/issues/README.md)** — it indexes
 every issue, states which track owns it, and shows where the design track
@@ -144,6 +240,8 @@ docker/
   mockup-nginx.conf    # static viewer for docs/mockup/
 includes/              # [exists] mailer.php, bootstrap.php, Database.php, functions.php, auth.php, Router.php
                        # [exists] header.php, footer.php — the two shells   [issue-013]
+                       # [exists] logging.php — the sanitised failure log [issue-022]
+                       # [exists] outbox.php — the mail queue             [issue-022]
   views/               # [exists] the four error pages + the bootstrap page [issue-014]
 views/                 # [exists] the six auth screens                   [issue-016]
                        # [exists] dashboard.php                          [issue-017]
@@ -165,12 +263,16 @@ database/
   schema.sql           # single source of truth for a fresh install   [issue-011 — exists]
   migrations/          # YYYYMMDD_short_name.sql, applied by hand (README.md = the contract)
   *_test.php           # standalone PHP CLI regression tests (the SOURCE tier)
+  install_sandbox.php  # the shared harness of the install tests (NOT a test itself) [issue-025]
+  outbox_worker.php    # the CLI mail worker — REQUIRED, not optional   [issue-022]
   live/                # the LIVE tier — sweeps the running application over HTTP
     *_test.php         # live_app_test.php, live_security_test.php
     run-live-tests.sh  # the runner (NOT part of run-tests.sh)
+storage/
+  sessions/            # the private session store, mode 0700        [issue-025 — git-ignored]
 docs/
   About.md             # the product brief
-  issues/              # issue specifications (20) — see docs/issues/README.md
+  issues/              # issue specifications (26) — see docs/issues/README.md
   mockup/              # static HTML mockups + the shared assets/ layer
 ````
 
@@ -184,7 +286,21 @@ The app service mounts the repository at
 in the tree is web-reachable unless `.htaccess` denies it.** The deny block in
 `.htaccess` is load-bearing — read it before adding a directory, and never
 replace the file wholesale. The rules are specified and measured in
-[docs/issues/issue-003.md](docs/issues/issue-003.md).
+[docs/issues/issue-003.md](docs/issues/issue-003.md) and
+[docs/issues/issue-023.md](docs/issues/issue-023.md).
+
+> **The deny block is a list of exceptions, not a default.** Every path that
+> is **not** on the list is served, so a file added to the repository *after*
+> the list was written is published with no warning and no failing test. When
+> you add a file to the web root, add the rule **in the same change** — and
+> add the path to `database/webroot_hardening_test.php` at the same time. The
+> test is the specification: it used to assert that `AGENTS.md` was
+> reachable, which is how a leak survived an audit.
+>
+> The one place a **single rule with a negative lookahead** is used is the
+> documentation directory: `^/?docs/(?!mockup(/|$))` exempts the mockup as a
+> whole path segment and refuses everything else under `docs/` — including a
+> file that is added later.
 
 > **LiteSpeed caches the parsed `.htaccess` in memory.** A rule you just added to
 > the file is **not** enforced until the server re-reads it. After editing
@@ -272,6 +388,25 @@ reads **only** `config.php`: no `getenv()`, no `$_ENV`, no `$_SERVER`. The
 wizard collects the two new values in step 2 of
 `docs/mockup/11-install-wizard.html`.
 
+### The session store’s one constant
+
+The session files are **not** written to the shared `/tmp`. They live in a
+private directory of the application, `storage/sessions/`, created with mode
+`0700`. The location is configurable, because the correct path is
+host-specific:
+
+````php
+const SESSION_SAVE_PATH = __DIR__ . '/storage/sessions';
+````
+
+It is the **15th** constant of the contract: it is declared in
+`config.template.php` **and** in `config.php`, and `database/config_test.php`
+guards the parity. `sessionSavePath()` in `includes/functions.php` resolves it
+in four steps — the constant, the application's own `storage/sessions`, the
+`php.ini` default when it is private, and a `0700` directory under the system
+temporary directory that carries the uid. A **symlink** at any of those paths
+is refused.
+
 ## Commands
 
 `php`, `composer`, `mysql`, and `mariadb` are **not on the host PATH** — everything runs
@@ -308,6 +443,12 @@ docker compose exec -T db mariadb -u root -p"$MYSQL_ROOT_PASSWORD" financial_tra
 bash database/live/run-live-tests.sh
 # LIVE_BASE_URL=http://127.0.0.1:8088 bash database/live/run-live-tests.sh
 
+# The outbox worker — sends the queued mail. REQUIRED in production: the
+# request path only queues, so an installation that never runs the worker
+# never sends mail. Run it from cron.
+docker compose exec -T app php /var/www/html/database/outbox_worker.php --limit=20
+docker compose exec -T app php /var/www/html/database/outbox_worker.php --quiet
+
 # Install the PHP dependencies — a VENDOR-TIME step, run from the project root.
 # Composer is not in the runtime image, so it is mounted in from /tmp.
 # Never run this at container start-up.
@@ -342,9 +483,24 @@ defaults are chosen so they do not collide with the sibling projects:
 | phpMyAdmin | `PHPMYADMIN_PORT` = **8090** | 80 | all interfaces |
 | LiteSpeed WebAdmin | `OLS_ADMIN_PORT` = **7080** | 7080 | **127.0.0.1 only** |
 
+> **The Bind column is what the compose file does, not what it should do.**
+> The WebAdmin binding used to be `- ${OLS_ADMIN_PORT:-7080}:7080` — no host
+> address, so it answered on **every** interface while this table claimed
+> loopback (issue-023). It is now `- "127.0.0.1:${OLS_ADMIN_PORT:-7080}:7080"`.
+> The WebAdmin is an admin surface: it reads the vhost configuration and the
+> logs and it restarts the server. **Remote access goes through an SSH
+> tunnel, not a bound port.**
+
 `docker compose` services are `db`, `app`, `phpmyadmin` (default profile) and
 `mockup` (profile `mockup`). A bare `docker compose up -d` must **not** start
 the mockup viewer.
+
+> **Every image in the compose file is pinned.** The app image is pinned to a
+> version tag (`1.9.4-lsphp85`) because the PHP floor is a security floor;
+> `phpmyadmin` and `nginx` are pinned **by digest**, because `latest` and
+> `alpine` both move under the registry and the difference is never reviewed.
+> To move a digest: `docker pull <image>:<tag>` and paste the digest from
+> `docker image inspect <image>:<tag> --format '{{index .RepoDigests 0}}'`.
 
 ### Two document-root paths
 
@@ -515,6 +671,35 @@ Day / week / month / year grouping belongs in the query, not in a PHP loop over 
 Store transaction dates as `DATE` in UTC, and keep the week-start rule in one place
 (`WEEK_START` config constant, Monday by default) so reports and the UI agree.
 
+### The average is a period total over the calendar — divided in SQL
+
+The average on `/reports` is `period total ÷ calendar units in the period`. The
+denominator is the **calendar**, never the number of transactions and never the
+number of buckets with data in them.
+
+- **There is no `AVG()`.** `AVG()` divides by the number of **rows**, which is
+  the number of transactions — the wrong denominator, and one that changes with
+  the data.
+- **The divisor is bound and cast**: `CAST(? AS DECIMAL(10,0))`. A divisor that
+  is bound as a **string** makes MariaDB divide in **DOUBLE**, and the average
+  arrives at the screen as a **float**. Bind it, cast it, read it back as a
+  string.
+- **The divisor is never interpolated.** It comes from `reportUnitCount()`.
+- **The net average is derived from the two rounded sides**, in SQL:
+  `ROUND(avg_income - avg_spending, 2)`. Round the sides independently and the
+  identity `avg_net = avg_income - avg_spending` breaks on the third decimal.
+- **A zero carries no sign.** The average lives on the **tiles**, so it uses
+  `formatSignedMoney()` for all three figures — the empty period reads
+  `0.00 per day`, never `+0.00 per day`.
+- **The week denominator is the number of distinct week buckets the range
+  touches**, and it comes from the same `WEEK_START` as the "Over time"
+  buckets. `reportWeekStart()` is the PHP twin of `reportBucketExpression()`,
+  and `reportWeekStartDayNumber()` is the **only** place the config's day
+  numbering is converted to MariaDB's — the two numberings differ by one for
+  every day except Sunday, and mixing them quietly moves the week.
+- The unit is the **visitor's choice** (`?unit=`, whitelisted to day / week /
+  month / year) and it is **named on the screen** next to every figure.
+
 The **period label** is a span, not a month: a range that straddles two months must not
 read "October", because the screen summed something that is not a calendar month.
 `formatPeriodLabel()` and `formatPeriodSpan()` are the only places a label is built, and
@@ -550,6 +735,32 @@ paint**, and the application has **no inline script** while the server cannot re
   bottom-nav links, `true` on the period links. `components.css` knows no
   `is-active`.
 
+### The response headers live in ONE function
+
+`sendSecurityHeaders()` in `includes/functions.php` holds the **whole** set —
+`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, a strict
+`Content-Security-Policy`, an 18-feature `Permissions-Policy`, COOP, CORP,
+`X-Permitted-Cross-Domain-Policies`, and the conditional HSTS pair.
+
+- **Exactly two call sites**: `index.php` and `install.php`. A third entry
+  point that forgets the call ships a page with no headers — the installer
+  shipped exactly that defect.
+- **Call it after `startSession()` and before the first byte of output.** A
+  `header()` call after the body has started is a warning, not a header.
+- **No `unsafe-inline`, no `unsafe-eval`, no `nonce`.** The theme travels in a
+  cookie and the application has **no inline script**, so the policy is
+  `script-src 'self'` with nothing to except.
+- **HSTS and `Upgrade-Insecure-Requests` only over HTTPS.** Sending HSTS over
+  plain HTTP is meaningless at best and pinning a host to HTTPS at worst.
+- **Never send `X-XSS-Protection`.** The modern browsers ignore it and the old
+  ones it broke were the ones it was meant to protect.
+- **Never send a header inline.** A second `header('X-…')` call in a view or a
+  controller is a second copy of the policy, and the two copies drift.
+- **The static tree is a vhost concern.** `mod_headers` is **not in the pinned
+  image** — measured three ways — so `.htaccess` cannot set a header on a CSS
+  or JS file. Do not leave a `Header` directive in `.htaccess` as decoration:
+  it is ignored **silently**.
+
 ### PHP tokenizer traps
 
 - A literal `?>` inside a `//` comment **still closes PHP mode** — the rest of the file
@@ -577,6 +788,64 @@ The two states a caller must distinguish:
 | Mail is not configured at all | `mailIsConfigured()` is `false` — the user must be told, and no connection is attempted. |
 | Mail is configured but the send failed | `sendMail()` returned `false` — the user gets a "try again later" message. |
 
+### The request path never sends mail — the outbox and the worker do
+
+Since issue-022 the **request path only queues**: `enqueueMail()` writes a row
+into `mail_outbox` and answers. The SMTP round trip happens in
+`database/outbox_worker.php`, a **CLI** script.
+
+- **The worker is part of the delivery path, not an optional extra.** An
+  installation that never runs it **never sends mail**. It is documented in
+  `docs/issues/README.md`, in `docs/About.md` and here, and the queue depth is
+  shown in the installation card of `/settings`.
+- **The request path must not call `sendMail()`.** A synchronous send is the
+  timing oracle of issue-022, and it is the unbounded wait of
+  [issue-022](docs/issues/issue-022.md) §7.3.
+- **The claim is exclusive** (`SELECT … FOR UPDATE SKIP LOCKED`), a retry
+  **re-uses** the row (an `UPDATE`, never an `INSERT`), and the attempts back
+  off. A transient failure must not produce a second copy of the message.
+- **The SMTP timeouts are explicit and bounded**: `$mail->Timeout`,
+  `$mail->SMTPOptions['socket']['timeout']` and `$mail->SMTPKeepAlive = false`.
+  A request that waits 30 seconds for a dead SMTP server is a denial of
+  service on its own.
+- **`mailQueueState()` is the installation's state**, not the address's —
+  `ready`, `not-configured` or `unavailable`. The reset screen must answer
+  **byte-identically** for a known and an unknown address in **every** state,
+  and it must never echo the submitted address back.
+
+### The request limiters are consulted in ONE call
+
+`takeRequestQuota()` raises the counters of the set it is given — but only
+when **none** of them is blocked. Two calls for two counters therefore raise
+the first counter for a request the second counter refused, and the window is
+extended by the requests that were turned away.
+
+- **Pass the whole set in one call.** The reset screen merges
+  `resetSourceLimiters()` and `resetAddressLimiters($email)` and calls
+  `takeRequestQuota()` once.
+- **The stricter of the counters wins, never the sum** — the same rule the
+  sign-in throttle follows.
+- **A refused request raises nothing.** The counters of a request move
+  together or not at all.
+- The limits live in `config.php` (`RESET_ADDRESS_LIMIT`,
+  `RESET_SOURCE_LIMIT`, `REGISTER_SOURCE_LIMIT`) and the whole mechanism has a
+  kill switch, `REQUEST_THROTTLE_ENABLED` — a **real boolean**, because a
+  limiter that fails open is the wrong way to fail.
+
+### The log carries the context, never the data
+
+`includes/logging.php` holds `logFailure(string $context, ?Throwable $ex = null)`.
+It writes the context, the class, the code and the file:line — and **never**
+`$ex->getMessage()`, because the message is where the submitted value lives.
+
+- **Never put a submitted value in a log line** — not the address, not the
+  password, not the identifier.
+- **The context is a literal the developer wrote.** It carries no personal
+  data, and it is what tells the operator what failed.
+- **A duplicate registration never reaches the log.** The unique-key violation
+  is caught and turned into the screen's existing *"that address is already
+  registered"* field error.
+
 ### The auth layer — the traps that leak other people's money records
 
 - **The front controller loads the mailer.** `index.php` requires
@@ -596,13 +865,70 @@ The two states a caller must distinguish:
 - **The sign-in throttle is counted per identifier**, in `login_attempts`,
   keyed by a SHA-256 of the lower-cased identifier. The account row can only
   lock an account that exists, so without the table the limit is bypassable by
-  typing a name that does not exist.
+  typing a name that does not exist. Since issue-021 the limiter is a
+  **decaying, two-counter backoff** — per identifier **and** per source — and
+  the effective penalty is the **stricter** of the two, never the sum.
+- **LiteSpeed rewrites `REMOTE_ADDR`.** See the rule below — the source
+  counter keys on the address that really connected, not on `REMOTE_ADDR`.
 - **The registration gate is two-sided** — `GET` and `POST`, and the `POST`
   check runs **before** the CSRF check and before any input is read (see the
   install/config contract above).
 - **`views/` is denied in `.htaccess`.** The views are rendered by the front
   controller and never requested directly. **Extend the deny block — never
   replace the file wholesale.**
+
+### The session never carries a secret
+
+The session file is **plain text on disk**. It is serialised by PHP and it
+lives in a directory of the application, mode `0700` — but the name of the
+file is the session id, so anybody who can write into that directory, or read
+it, holds the state of a visitor. **No secret goes into it.**
+
+- **The installer holds no secret at all.** `installSaveState()` is the **one**
+  function that writes `$_SESSION['install']`, and it drops `db_pass` and
+  `smtp_pass` before the write — whatever the caller put into the array.
+  `installState()` drops them again on the **read**, so a session written by an
+  earlier version of the wizard is cleaned the next time it writes its state.
+- **A secret is read raw and used inside the request that collects it.** The
+  wizard asks for the database and the SMTP password **again** on step 3, in
+  empty fields, and proves them before it writes `config.php`. The written
+  file holds the password **exactly** as it was typed — the trimming is never
+  applied to the value that is written.
+- **`session.use_strict_mode` is `1`**, set **before** `session_start()`. PHP
+  reads it when it opens the session, not afterwards. An unknown session id is
+  not adopted and no file is created under that name.
+- **The session id is rotated at the wizard's start and after every step
+  boundary** — `session_regenerate_id(true)`. The rotation never happens on a
+  POST: the CSRF token lives in the session, and a rotation before the CSRF
+  check would throw it away.
+- **The store is `storage/sessions/`**, mode `0700`, denied by `.htaccess` —
+  the name of a session file **is** the session id, so a directory listing
+  hands out the live sessions of the visitors. It is **git-ignored**.
+- **The application’s own session carries the user id and the credential
+  version** — never the password hash, never a token.
+
+### LiteSpeed rewrites `REMOTE_ADDR`
+
+LiteSpeed — like every server with a "use the client IP from the header" option —
+**overwrites `$_SERVER['REMOTE_ADDR']` with the first element of
+`X-Forwarded-For`** (and with `X-Real-IP`) whenever the request arrives from a
+**trusted peer**, and the loopback interface is trusted by default. The address
+that really connected is kept in `$_SERVER['PROXY_REMOTE_ADDR']`, which is
+**unset** when nothing was folded.
+
+So on this stack `REMOTE_ADDR` is **not** the address of the connection — it is
+whatever the visitor typed in the header. The application never reads the header,
+but the **server substitutes it**, which is worse than reading it: a key built
+from `REMOTE_ADDR` is a dial the visitor can turn.
+
+- Anything that keys on the client address uses **`PROXY_REMOTE_ADDR`**, falling
+  back to `REMOTE_ADDR` — `loginSourceKey()` in `includes/auth.php` is the
+  reference implementation.
+- Behind a reverse proxy the peer is the **proxy's** address, so the bucket is
+  shared. That is the documented behaviour, not a bug.
+- This is a **LIVE-tier** defect: the SOURCE tier asserted that the header was
+  not read and passed, while the running server rewrote the address anyway.
+  `database/live/live_security_test.php` §H is the proof.
 
 ### Never `docker compose down -v`
 
@@ -613,7 +939,7 @@ The two states a caller must distinguish:
 | Doc | Use it for |
 |---|---|
 | [docs/About.md](docs/About.md) | The product brief: purpose, stack, installation contract. |
-| [docs/issues/README.md](docs/issues/README.md) | The index of all 20 issues — DevOps (001–003, 009–010), UX/UI (004–008) and the application (011–020). |
+| [docs/issues/README.md](docs/issues/README.md) | The index of all 26 issues — DevOps (001–003, 009–010), UX/UI (004–008), the application (011–020), the security audit (021–025) and the requirement gap (026). |
 | [docs/issues/issue-001.md](docs/issues/issue-001.md) | The Docker Compose stack: services, ports, volumes, env variables. |
 | [docs/issues/issue-002.md](docs/issues/issue-002.md) | The mockup viewer container and the `docs/mockup/` contract. |
 | [docs/issues/issue-003.md](docs/issues/issue-003.md) | The web-root hardening, the `config.php` write path, the CLI harness path. |
@@ -622,6 +948,8 @@ The two states a caller must distinguish:
 | [docs/issues/issue-009.md](docs/issues/issue-009.md) | The PHP 8.5.12 runtime floor: PHP2Shell, the pinned image tag, the paths that move. |
 | [docs/issues/issue-010.md](docs/issues/issue-010.md) | The Composer vendor-time policy, the PHPMailer choice, the mailer config contract. |
 | [docs/issues/issue-011.md](docs/issues/issue-011.md) – [issue-020.md](docs/issues/issue-020.md) | The application specification: the schema, the runtime, the tokens, the front controller, the installer, the authentication and the five screens. |
+| [docs/issues/issue-021.md](docs/issues/issue-021.md) – [issue-025.md](docs/issues/issue-025.md) | The 2026-10-28 security audit: the throttle as a DoS, the unthrottled and enumerating endpoints, the web-root disclosure, the response headers, the installer secrets. **021–025 are all implemented & verified.** |
+| [docs/issues/issue-026.md](docs/issues/issue-026.md) | The requirement gap against [docs/About.md](docs/About.md): the missing **average**. **Implemented & verified.** |
 | [docs/mockup/README.md](docs/mockup/README.md) | The mockup delivery contract: file naming, self-containment, shared assets. |
 | [.github/skills/dev-stack-ops/SKILL.md](.github/skills/dev-stack-ops/SKILL.md) | Operating the LiteSpeed + MariaDB dev stack, running tests, DB access. |
 | [.github/instructions/](.github/instructions/) | Scoped conventions for PHP, database, tests, and front-end code. |

@@ -97,12 +97,13 @@ DEALLOCATE PREPARE ft_stmt;
 --                      algorithm may change and the column must not have to.
 --   status             'disabled' is the "This account is not available."
 --                      state on the sign-in screen.
---   failed_attempts    server-side login throttle — the ACCOUNT's own copy of
---   locked_until       the counter. The authoritative counter lives in
---                      login_attempts, against the identifier, because an
---                      identifier that matches no account has no users row to
---                      lock (issue-016 §6). Both are written together and
---                      both are cleared by a successful sign-in.
+--
+-- There are NO throttle columns on the account. They were there from
+-- issue-016 and they were never read: the counter that decides the wait
+-- lives in login_attempts, against the identifier and against the source,
+-- so the columns on the account were a second copy of a number nothing
+-- looked at — and a password change "cleared" them, promising an unlock
+-- it could not perform (issue-021 §6 and §8.4).
 -- --------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `users` (
     `id`                INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -111,8 +112,6 @@ CREATE TABLE IF NOT EXISTS `users` (
     `password_hash`     VARCHAR(255) NOT NULL,
     `email_verified_at` DATETIME     NULL DEFAULT NULL,
     `status`            ENUM('active','disabled') NOT NULL DEFAULT 'active',
-    `failed_attempts`   INT UNSIGNED NOT NULL DEFAULT 0,
-    `locked_until`      DATETIME     NULL DEFAULT NULL,
     `created_at`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `updated_at`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
@@ -122,34 +121,45 @@ CREATE TABLE IF NOT EXISTS `users` (
 
 
 -- --------------------------------------------------------------------------
--- login_attempts — the sign-in throttle, counted per IDENTIFIER.
+-- login_attempts — the sign-in throttle: TWO counters, one table.
 --
---   identifier_hash  sha256 of the lowercased sign-in identifier (a username
---                    or an email address). The hash is the key: it is a
---                    fixed length, it is case-insensitive by construction,
---                    and the table never stores an address that was typed at
---                    the sign-in form.
+--   scope             'identifier' or 'source'. The scope says what the
+--                    key is, and the two counters are independent: the
+--                    effective penalty is the STRICTER of them, never the
+--                    sum (issue-021 §8.1).
+--   key_hash          sha256 of the lowercased sign-in identifier (a
+--                    username or an email address) for the 'identifier'
+--                    scope, and sha256 of REMOTE_ADDR for the 'source'
+--                    scope. The hash is the key: it is a fixed length, it
+--                    is case-insensitive by construction, and the table
+--                    never stores an address that was typed at the form.
 --   failed_attempts  the number of failures in the current window.
 --   locked_until     when the counter reached the threshold, the moment the
---                    wait ends. NULL while the identifier is not locked.
+--                    wait ends. NULL while the counter is not serving a
+--                    wait.
+--   last_failure_at  when the last failure was recorded. The quiet window
+--                    is measured from here: a failure older than the
+--                    window does not count, which is what lets the owner
+--                    of an account sign in again after the attacker stops
+--                    (issue-021 §3 and §8.1).
 --
 -- WHY A TABLE OF ITS OWN: the throttle has to cover an identifier that
--- matches NO account. `users.failed_attempts` can only lock an account that
--- exists, so a visitor who types a name that does not exist five times
--- would never be throttled — the limit would be bypassable by using a
--- non-existent name. The counter therefore lives against the IDENTIFIER,
--- and the users columns hold the same numbers for the account that was
--- matched (issue-016 §6).
+-- matches NO account. A counter on the account could only lock an account
+-- that exists, so a visitor who types a name that does not exist five
+-- times would never be throttled — the limit would be bypassable by using
+-- a non-existent name (issue-016 §6).
 -- --------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `login_attempts` (
     `id`              INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    `identifier_hash` CHAR(64)     NOT NULL,
+    `scope`           ENUM('identifier','source') NOT NULL DEFAULT 'identifier',
+    `key_hash`        CHAR(64)     NOT NULL,
     `failed_attempts` INT UNSIGNED NOT NULL DEFAULT 0,
     `locked_until`    DATETIME     NULL DEFAULT NULL,
+    `last_failure_at` DATETIME     NULL DEFAULT NULL,
     `created_at`      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `updated_at`      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
-    UNIQUE KEY `uq_login_attempts_identifier` (`identifier_hash`),
+    UNIQUE KEY `uq_login_attempts_scope_key` (`scope`,`key_hash`),
     KEY `idx_login_attempts_updated` (`updated_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -264,15 +274,108 @@ CREATE TABLE IF NOT EXISTS `email_verifications` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
+-- --------------------------------------------------------------------------
+-- request_throttles — the generic request throttle.
+--
+--   bucket           WHICH limiter the row belongs to: 'reset:address',
+--                    'reset:source', 'register:source'. The bucket is part
+--                    of the unique key, so the same key can hold one row
+--                    per limiter.
+--   key_hash         sha256 of the thing being counted. For an address
+--                    limiter it is the sha256 of the lower-cased address;
+--                    for a source limiter it is the sha256 of the peer
+--                    address that really opened the connection. The hash is
+--                    the key: the table never stores what the visitor typed.
+--   hits             the number of hits in the CURRENT window.
+--   window_started_at when the current window opened. A hit that arrives
+--                    after the window closed starts a new one and resets
+--                    the count to 1 — that is the decay: an old count
+--                    stops counting, and the row does not grow forever.
+--
+-- WHY A TABLE AND NOT A COLUMN: the sign-in throttle proved the point. A
+-- counter on the account can only slow an account that exists, so a
+-- visitor who types a name that does not exist is never limited. The same
+-- applies to the reset screen: the limiter has to cover an address that
+-- matches no account, and the source limiter has to cover a source that
+-- has never registered (issue-022 §7.2).
+--
+-- The rows are pruned: a window that closed long ago is deleted, so the
+-- table cannot grow without bound (issue-022 §8).
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `request_throttles` (
+    `id`                INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `bucket`            VARCHAR(32)  NOT NULL,
+    `key_hash`          CHAR(64)     NOT NULL,
+    `hits`              INT UNSIGNED NOT NULL DEFAULT 0,
+    `window_started_at` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `created_at`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_request_throttles_bucket_key` (`bucket`,`key_hash`),
+    KEY `idx_request_throttles_window` (`window_started_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- --------------------------------------------------------------------------
+-- mail_outbox — the outgoing mail queue.
+--
+-- The registration and the forgot-password screens do NOT talk to the SMTP
+-- server. They write the message here and answer the visitor; a CLI worker
+-- sends it afterwards. That is what makes the two screens answer in the
+-- same time whatever the address is: the request no longer waits for a
+-- network round trip that a known address causes and an unknown one does
+-- not (issue-022 §7.1).
+--
+--   to_address  the recipient. It is a real address, so this table holds
+--               personal data — which is exactly why the whole database/
+--               directory is denied by .htaccess and the table is never
+--               exposed to the web.
+--   body        the message. A reset link lives here until the worker
+--               sends it, so the table is as sensitive as the mail store
+--               it replaces.
+--   status      'queued' -> 'sent', or 'failed' after the retry budget is
+--               spent. A retry re-uses the SAME row: a retry is never a
+--               second row, so a transient failure cannot send the message
+--               twice.
+--   attempts    how many times the worker has tried.
+--   claimed_at  when the worker took the row. A stale claim (a worker that
+--               died mid-send) is taken back after the lease expires.
+--   next_attempt_at
+--               when the row may be tried again. A failed send is put back
+--               with a BACKOFF — the wait grows with every attempt — so a
+--               dead SMTP server is not hammered and the row is picked up
+--               again as soon as the wait is over.
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `mail_outbox` (
+    `id`         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `to_address` VARCHAR(254) NOT NULL,
+    `subject`    VARCHAR(255) NOT NULL,
+    `body`       TEXT         NOT NULL,
+    `status`     ENUM('queued','sent','failed') NOT NULL DEFAULT 'queued',
+    `attempts`   INT UNSIGNED NOT NULL DEFAULT 0,
+    `last_error` VARCHAR(255) NULL DEFAULT NULL,
+    `claimed_at` DATETIME     NULL DEFAULT NULL,
+    `created_at` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `sent_at`    DATETIME     NULL DEFAULT NULL,
+    `next_attempt_at` DATETIME NULL DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_mail_outbox_status_created` (`status`,`created_at`),
+    KEY `idx_mail_outbox_claimed` (`claimed_at`),
+    KEY `idx_mail_outbox_next_attempt` (`status`,`next_attempt_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
 -- ==========================================================================
 -- The tables:
 --
 --   users               the accounts
 --   login_attempts      the sign-in throttle, counted per identifier
+--   request_throttles   the generic request throttle (reset, register)
 --   categories          the per-user labels (income | expense)
 --   transactions        the ledger — income and spending in one table
 --   password_resets     the single-use password reset tokens (hash only)
 --   email_verifications the single-use confirmation tokens (hash only)
+--   mail_outbox         the outgoing mail queue (sent by the CLI worker)
 --
 -- There is NO "uncategorised" row. An uncategorised transaction is a
 -- transaction whose `category_id IS NULL` — that is what deleting a category

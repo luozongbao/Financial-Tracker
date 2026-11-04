@@ -30,10 +30,44 @@
  *   * the credential version, which ends every other session of an account
  *     when its password changes.
  *
+ * Issue-021 (§8) reshapes the attempt limit, because a hard lock is a
+ * denial-of-service weapon in the hands of anybody who can reach the form:
+ *
+ *   * the penalty DECAYS — a failure older than the quiet window stops
+ *     counting, so the owner of an account is let back in once the window
+ *     has elapsed;
+ *   * the wait BACKS OFF — it doubles with every failure beyond the limit
+ *     and is capped, and the locked screen states the time that is really
+ *     left;
+ *   * there are TWO counters, against the identifier and against the
+ *     source, and the effective penalty is the STRICTER of the two — never
+ *     the sum, so the source counter can never be the only one;
+ *   * the count is raised IN SQL, so two failures that land together raise
+ *     the counter by two;
+ *   * the rows that can no longer produce a wait are removed, so the
+ *     table does not grow at the rate of the network.
+ *
+ * Issue-022 (§7.2) adds a SECOND, generic limiter — the request throttle:
+ *
+ *   * one table, `request_throttles`, serves every endpoint that needs a
+ *     limiter the sign-in throttle does not fit;
+ *   * a counter per KEY (a hash of the submitted address) and a counter
+ *     per SOURCE (the peer that really connected), and the effective
+ *     penalty is the STRICTER of the two;
+ *   * the counters DECAY: a count whose window closed reads zero;
+ *   * a refused request does NOT raise the counter, so the window is not
+ *     extended by the requests that were turned away;
+ *   * REQUEST_THROTTLE_ENABLED in config.php is the kill switch.
+ *
  * Configuration comes from config.php and from nothing else.
  */
 
 declare(strict_types=1);
+
+// The sanitised error log. Two of the helpers below log a failure, and
+// the log must never carry an exception MESSAGE — a unique-key violation
+// carries the submitted address in it (issue-022 §7.4).
+require_once __DIR__ . '/logging.php';
 
 /*
  * The product's own rules. They are declared with a guard because this file
@@ -44,8 +78,40 @@ if (!defined('LOGIN_ATTEMPT_LIMIT')) {
     /** The failed sign-ins that start a wait (issue-016 §6). */
     define('LOGIN_ATTEMPT_LIMIT', 5);
 
-    /** How long the wait lasts, in minutes (issue-016 §6). */
+    /**
+     * How long the first wait lasts, in minutes (issue-016 §6).
+     *
+     * The account's quiet window is LOGIN_BACKOFF_MAX_MINUTES, not this value:
+     * with a window equal to the wait, the counter resets as the lock ends and
+     * the escalation is unreachable (issue-021 DEFECT-1).
+     */
     define('LOGIN_LOCK_MINUTES', 15);
+
+    /**
+     * The longest wait a counter ever serves, in minutes (issue-021 §8).
+     *
+     * The backoff doubles with every failure beyond the limit, and this is
+     * where it stops.
+     */
+    define('LOGIN_BACKOFF_MAX_MINUTES', 60);
+
+    /**
+     * The failed sign-ins from ONE source that start a wait (issue-021 §3).
+     *
+     * The source counter bounds the attacker who rotates the identifier,
+     * so its limit is deliberately higher than the identifier's: a visitor
+     * behind a NAT shares the bucket with everybody else, and the source
+     * counter is never the only counter.
+     */
+    define('LOGIN_SOURCE_ATTEMPT_LIMIT', 20);
+
+    /**
+     * The quiet window of the source counter, in minutes (issue-021 §8).
+     *
+     * It is longer than the identifier's, so the source counter decays on
+     * a slower schedule than the one that guards a single account.
+     */
+    define('LOGIN_SOURCE_WINDOW_MINUTES', 60);
 
     /** The shortest password the product accepts (issue-016 §5). */
     define('PASSWORD_MIN_LENGTH', 10);
@@ -63,10 +129,11 @@ if (!defined('LOGIN_ATTEMPT_LIMIT')) {
      * The floor of the forgot-password response time, in milliseconds.
      *
      * The screen must answer a known address and an unknown address in the
-     * same time (issue-016 §9). The floor hides the difference between the
-     * two database paths; what is left is the SMTP round trip of a real
-     * send, which cannot be equalised without sending mail that has no
-     * recipient.
+     * same time (issue-016 §9). Since issue-022 §7.1 the request does not
+     * talk to the SMTP server at all — it writes a row into the outbox —
+     * so what is left to hide is the ONE extra INSERT the known branch
+     * pays. That is milliseconds, and the floor puts it inside 500 ms,
+     * where it cannot be told apart from the unknown branch.
      */
     define('AUTH_TIMING_FLOOR_MILLISECONDS', 500);
 }
@@ -448,8 +515,8 @@ function createUser(string $username, string $email, string $password): array
     try {
         $db->execute(
             'INSERT INTO users
-                (username, email, password_hash, email_verified_at, status, failed_attempts, locked_until)
-                  VALUES (?, ?, ?, NULL, \'active\', 0, NULL)',
+                (username, email, password_hash, email_verified_at, status)
+                  VALUES (?, ?, ?, NULL, \'active\')',
             [$username, $email, hashPassword($password)]
         );
     } catch (PDOException $ex) {
@@ -468,11 +535,11 @@ function createUser(string $username, string $email, string $password): array
 }
 
 // ---------------------------------------------------------------------------
-// The attempt limit (issue-016 §6)
+// The attempt limit (issue-016 §6, issue-021 §8)
 // ---------------------------------------------------------------------------
 
 /**
- * The key of the throttle counter.
+ * The key of the identifier counter.
  *
  * The identifier is hashed: the counter must work for a name that matches
  * no account, and the table has no business keeping the string that was
@@ -493,128 +560,747 @@ function loginIdentifierKey(string $identifier): string
 }
 
 /**
- * The throttle state of an identifier.
+ * The key of the source counter.
  *
- * One mechanism, two cases: the counter lives against the IDENTIFIER, so
- * it works for an account that exists and for one that does not. The
- * users.failed_attempts column holds the same numbers for the account that
- * was matched, and is cleared by a successful sign-in.
+ * The key is the address that OPENED the connection. That is the one
+ * value on the path that the visitor cannot choose, so it is the only one
+ * that can serve as a throttle key.
  *
- * @return array{locked: bool, locked_until: ?string, attempts: int}
+ * The address of the connection is NOT simply $_SERVER['REMOTE_ADDR']:
+ * LiteSpeed — like every other server with a "use the client IP from the
+ * header" option — REWRITES REMOTE_ADDR with the first element of
+ * X-Forwarded-For (or with X-Real-IP) whenever the request arrives from a
+ * trusted peer, and the loopback interface is trusted by default. After
+ * that rewrite REMOTE_ADDR is whatever the visitor typed in the header:
+ * a throttle key the visitor picks is an attacker's dial, and it hands
+ * the visitor the right to choose their own bucket — or to fill somebody
+ * else's.
+ *
+ * LiteSpeed keeps the address that really connected in
+ * $_SERVER['PROXY_REMOTE_ADDR'], and leaves it unset when it folded
+ * nothing. So the peer is PROXY_REMOTE_ADDR when it is there, and
+ * REMOTE_ADDR otherwise — on a bare install, and on any server that does
+ * not rewrite the address, the two are the same value.
+ *
+ * Behind a reverse proxy the peer is the PROXY's address, so every
+ * visitor shares one bucket. That is exactly why the source counter is
+ * never the only counter — the identifier counter is the primary defence,
+ * and the effective penalty is the stricter of the two, never the sum.
  */
-function loginThrottleState(string $identifier): array
+function loginSourceKey(): string
 {
-    $db = Database::getInstance();
+    $peer = trim((string) ($_SERVER['PROXY_REMOTE_ADDR'] ?? ''));
 
-    $row = $db->fetchOne(
-        'SELECT failed_attempts, locked_until
-           FROM login_attempts
-          WHERE identifier_hash = ?',
-        [loginIdentifierKey($identifier)]
-    );
-
-    if ($row === false) {
-        return ['locked' => false, 'locked_until' => null, 'attempts' => 0];
+    if ($peer === '') {
+        $peer = trim((string) ($_SERVER['REMOTE_ADDR'] ?? ''));
     }
 
-    $lockedUntil = $row['locked_until'] ?? null;
+    return hash('sha256', $peer);
+}
 
-    if ($lockedUntil !== null) {
-        $expiresAt = strtotime((string) $lockedUntil . ' UTC');
+/**
+ * A moment of the throttle table, in seconds.
+ *
+ * The table stores UTC, so the parse has to say UTC too — otherwise the
+ * wait would be off by the server's own offset.
+ */
+function loginTimestamp(?string $value): int
+{
+    if ($value === null || $value === '') {
+        return 0;
+    }
 
-        if ($expiresAt !== false && $expiresAt <= time()) {
-            // The wait is over. The counter starts again from zero, so a
-            // lock never becomes a permanent denial of service for the
-            // owner of the account.
-            $db->execute(
-                'UPDATE login_attempts
-                    SET failed_attempts = 0, locked_until = NULL
-                  WHERE identifier_hash = ?',
-                [loginIdentifierKey($identifier)]
-            );
+    $timestamp = strtotime($value . ' UTC');
 
-            return ['locked' => false, 'locked_until' => null, 'attempts' => 0];
-        }
+    return $timestamp === false ? 0 : $timestamp;
+}
 
-        return [
-            'locked'       => true,
-            'locked_until' => (string) $lockedUntil,
-            'attempts'     => (int) $row['failed_attempts'],
-        ];
+/**
+ * The row of ONE counter, as it is stored.
+ *
+ * @return array{attempts: int, locked_until: ?string, last_failure_at: ?string}
+ */
+function loginCounterRow(string $scope, string $key): array
+{
+    $row = Database::getInstance()->fetchOne(
+        'SELECT failed_attempts, locked_until, last_failure_at
+           FROM login_attempts
+          WHERE scope = ? AND key_hash = ?',
+        [$scope, $key]
+    );
+
+    if (!is_array($row)) {
+        return ['attempts' => 0, 'locked_until' => null, 'last_failure_at' => null];
     }
 
     return [
-        'locked'       => false,
-        'locked_until' => null,
-        'attempts'     => (int) $row['failed_attempts'],
+        'attempts'        => (int) $row['failed_attempts'],
+        'locked_until'    => $row['locked_until'] !== null ? (string) $row['locked_until'] : null,
+        'last_failure_at' => $row['last_failure_at'] !== null ? (string) $row['last_failure_at'] : null,
     ];
+}
+
+/**
+ * ONE counter, with the decay applied.
+ *
+ * A failure older than the quiet window does not count. When the counter
+ * has been quiet for longer than the window, the row is reset and the
+ * failures are gone — which is what lets the owner of an account sign in
+ * again after the attacker stops.
+ *
+ * A row that is SERVING a wait is never reset: the count is what decides
+ * the length of the NEXT wait, and resetting it mid-wait would shorten the
+ * penalty the attacker has already earned.
+ *
+ * @return array{attempts: int, locked_until: ?string}
+ */
+function loginCounterState(string $scope, string $key, int $windowMinutes): array
+{
+    $row = loginCounterRow($scope, $key);
+
+    $lockedUntil = $row['locked_until'];
+    $serving     = $lockedUntil !== null && loginTimestamp($lockedUntil) > time();
+
+    if ($serving) {
+        return ['attempts' => $row['attempts'], 'locked_until' => $lockedUntil];
+    }
+
+    $last = $row['last_failure_at'];
+
+    if ($last !== null && loginTimestamp($last) > time() - ($windowMinutes * 60)) {
+        // Still inside the quiet window: the failures count.
+        return ['attempts' => $row['attempts'], 'locked_until' => null];
+    }
+
+    // Quiet for longer than the window: the failures have decayed and the
+    // counter starts again from zero.
+    if ($row['attempts'] !== 0 || $lockedUntil !== null) {
+        Database::getInstance()->execute(
+            'UPDATE login_attempts
+                SET failed_attempts = 0, locked_until = NULL
+              WHERE scope = ? AND key_hash = ?',
+            [$scope, $key]
+        );
+    }
+
+    return ['attempts' => 0, 'locked_until' => null];
+}
+
+/**
+ * The length of the wait a counter serves.
+ *
+ * The wait GROWS with the number of failures: at the limit it is the base
+ * window, and every failure beyond that doubles it, up to the cap. Below
+ * the limit there is no wait at all — the FIRST failure costs nothing.
+ */
+function loginBackoffMinutes(int $attempts, int $limit, int $baseMinutes, int $capMinutes): int
+{
+    if ($attempts < $limit) {
+        return 0;
+    }
+
+    // The exponent is capped: a counter that reached a thousand must not
+    // overflow the multiplication.
+    $steps   = $attempts - $limit;
+    $minutes = $baseMinutes * (2 ** min($steps, 10));
+
+    return (int) min($capMinutes, $minutes);
+}
+
+/**
+ * The throttle state of an identifier.
+ *
+ * TWO counters: the failures against the IDENTIFIER — the defence against
+ * a password guesser, and the reason a name that matches no account is
+ * throttled too — and the failures against the SOURCE, which bound the
+ * attacker who rotates the identifier.
+ *
+ * The effective penalty is the STRICTER of the two, NEVER the sum. A
+ * visitor behind a NAT shares the source bucket with everybody else, so
+ * the source counter may never be the only one and may never add to the
+ * identifier's.
+ *
+ * @return array{
+ *     locked: bool,
+ *     locked_until: ?string,
+ *     attempts: int,
+ *     source_attempts: int,
+ *     wait_minutes: int
+ * }
+ */
+function loginThrottleState(string $identifier): array
+{
+    $identifierCounter = loginCounterState(
+        'identifier',
+        loginIdentifierKey($identifier),
+        (int) LOGIN_BACKOFF_MAX_MINUTES
+    );
+
+    $sourceCounter = loginCounterState(
+        'source',
+        loginSourceKey(),
+        (int) LOGIN_SOURCE_WINDOW_MINUTES
+    );
+
+    // The stricter of the two: the wait that ends LAST is the one served.
+    $until = null;
+
+    foreach ([$identifierCounter['locked_until'], $sourceCounter['locked_until']] as $candidate) {
+        if ($candidate === null) {
+            continue;
+        }
+
+        if ($until === null || loginTimestamp($candidate) > loginTimestamp($until)) {
+            $until = $candidate;
+        }
+    }
+
+    $waitMinutes = 0;
+
+    if ($until !== null) {
+        $remaining   = loginTimestamp($until) - time();
+        $waitMinutes = $remaining > 0 ? (int) ceil($remaining / 60) : 0;
+    }
+
+    return [
+        'locked'          => $until !== null,
+        'locked_until'    => $until,
+        'attempts'        => $identifierCounter['attempts'],
+        'source_attempts' => $sourceCounter['attempts'],
+        'wait_minutes'    => $waitMinutes,
+    ];
+}
+
+/**
+ * Raise ONE counter by one failure.
+ *
+ * The count is raised IN SQL — `failed_attempts = failed_attempts + 1` —
+ * so two failures that land together raise the counter by TWO and not by
+ * one. The old code read the count, added one in PHP and wrote the total
+ * back, which loses a count under concurrency; the comment that claimed
+ * the opposite was wrong (issue-021 §5).
+ *
+ * The wait is derived from the POST-INCREMENT value, which is why the row
+ * is read back after the upsert.
+ */
+function loginRaiseCounter(string $scope, string $key, int $limit, int $windowMinutes): void
+{
+    $db = Database::getInstance();
+
+    $now = utcNow()->format('Y-m-d H:i:s');
+
+    // The decay first: a failure older than the quiet window does not
+    // count, so the count starts again from zero.
+    loginCounterState($scope, $key, $windowMinutes);
+
+    $db->execute(
+        'INSERT INTO login_attempts
+            (scope, key_hash, failed_attempts, locked_until, last_failure_at)
+              VALUES (?, ?, 1, NULL, ?)
+         ON DUPLICATE KEY UPDATE
+              failed_attempts = failed_attempts + 1,
+              last_failure_at = VALUES(last_failure_at)',
+        [$scope, $key, $now]
+    );
+
+    // The row the upsert just wrote — the post-increment value.
+    $row = $db->fetchOne(
+        'SELECT failed_attempts FROM login_attempts WHERE scope = ? AND key_hash = ?',
+        [$scope, $key]
+    );
+
+    $attempts = is_array($row) ? (int) $row['failed_attempts'] : 1;
+
+    $minutes    = loginBackoffMinutes($attempts, $limit, (int) LOGIN_LOCK_MINUTES, (int) LOGIN_BACKOFF_MAX_MINUTES);
+    $lockedUntil = null;
+
+    if ($minutes > 0) {
+        $lockedUntil = utcNow()
+            ->modify('+' . $minutes . ' minutes')
+            ->format('Y-m-d H:i:s');
+    }
+
+    $db->execute(
+        'UPDATE login_attempts
+            SET locked_until = ?
+          WHERE scope = ? AND key_hash = ?',
+        [$lockedUntil, $scope, $key]
+    );
 }
 
 /**
  * Record one failed sign-in.
  *
- * The counter is incremented against the identifier, and the account's own
- * columns are updated as well when an account was matched. The wait starts
- * when the counter reaches the limit.
+ * BOTH counters are raised: the one against the identifier and the one
+ * against the source.
  */
-function recordLoginFailure(string $identifier, ?int $userId = null): void
+function recordLoginFailure(string $identifier): void
 {
-    $db = Database::getInstance();
-
-    $state    = loginThrottleState($identifier);
-    $attempts = $state['attempts'] + 1;
-
-    $lockedUntil = null;
-
-    if ($attempts >= LOGIN_ATTEMPT_LIMIT) {
-        $lockedUntil = utcNow()
-            ->modify('+' . LOGIN_LOCK_MINUTES . ' minutes')
-            ->format('Y-m-d H:i:s');
-    }
-
-    // One statement, so two simultaneous failures cannot lose a count.
-    $db->execute(
-        'INSERT INTO login_attempts (identifier_hash, failed_attempts, locked_until)
-              VALUES (?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-              failed_attempts = VALUES(failed_attempts),
-              locked_until   = VALUES(locked_until)',
-        [loginIdentifierKey($identifier), $attempts, $lockedUntil]
+    loginRaiseCounter(
+        'identifier',
+        loginIdentifierKey($identifier),
+        (int) LOGIN_ATTEMPT_LIMIT,
+        (int) LOGIN_BACKOFF_MAX_MINUTES
     );
 
-    if ($userId !== null) {
-        $db->execute(
-            'UPDATE users
-                SET failed_attempts = ?, locked_until = ?
-              WHERE id = ?',
-            [$attempts, $lockedUntil, $userId]
-        );
-    }
+    loginRaiseCounter(
+        'source',
+        loginSourceKey(),
+        (int) LOGIN_SOURCE_ATTEMPT_LIMIT,
+        (int) LOGIN_SOURCE_WINDOW_MINUTES
+    );
+
+    // The housekeeping: the rows that can no longer produce a wait go.
+    pruneLoginAttempts();
 }
 
 /**
  * Clear the throttle after a successful sign-in.
  *
- * The identifier's counter is deleted and the account's columns go back to
- * zero — the two are one counter, and a success clears both.
+ * BOTH counters are cleared: the failures against the identifier and the
+ * failures against the source (issue-021 §8.1). A success is the proof
+ * that the person at the keyboard knows the password, so the failures that
+ * piled up behind it are meaningless.
  */
-function clearLoginFailures(string $identifier, ?int $userId = null): void
+function clearLoginFailures(string $identifier): void
 {
     $db = Database::getInstance();
 
     $db->execute(
-        'DELETE FROM login_attempts WHERE identifier_hash = ?',
-        [loginIdentifierKey($identifier)]
+        'DELETE FROM login_attempts WHERE scope = ? AND key_hash = ?',
+        ['identifier', loginIdentifierKey($identifier)]
     );
 
-    if ($userId !== null) {
-        $db->execute(
-            'UPDATE users
-                SET failed_attempts = 0, locked_until = NULL
-              WHERE id = ?',
-            [$userId]
-        );
+    $db->execute(
+        'DELETE FROM login_attempts WHERE scope = ? AND key_hash = ?',
+        ['source', loginSourceKey()]
+    );
+}
+
+/**
+ * Clear the failures against ONE identifier and leave the source counter
+ * alone.
+ *
+ * The password change in /settings uses this one: the visitor proved they
+ * know the current password, so the failures against that account's
+ * identifiers are forgiven — but the failures from the source address are
+ * shared with everybody else and are not theirs to clear.
+ */
+function clearLoginIdentifierFailures(string $identifier): void
+{
+    Database::getInstance()->execute(
+        'DELETE FROM login_attempts WHERE scope = ? AND key_hash = ?',
+        ['identifier', loginIdentifierKey($identifier)]
+    );
+}
+
+/**
+ * Remove the rows that can no longer produce a wait.
+ *
+ * A row whose wait is over AND whose last failure is older than the quiet
+ * window is dead weight — it can never lock anything again. Without this
+ * the table grows at the rate of the network: one row per identifier an
+ * attacker ever typed, kept forever (issue-021 §7).
+ *
+ * The delete is bounded, and the probe in front of it keeps the statement
+ * off the hot path: while nothing is stale the probe answers without
+ * touching a row.
+ */
+function pruneLoginAttempts(): void
+{
+    $db = Database::getInstance();
+
+    $identifierWindow = (int) LOGIN_BACKOFF_MAX_MINUTES;
+    $sourceWindow    = (int) LOGIN_SOURCE_WINDOW_MINUTES;
+
+    $stale = $db->fetchOne(
+        'SELECT COUNT(*) AS stale
+           FROM login_attempts
+          WHERE (locked_until IS NULL OR locked_until <= UTC_TIMESTAMP())
+            AND last_failure_at IS NOT NULL
+            AND (
+                 (scope = ? AND last_failure_at <= TIMESTAMPADD(MINUTE, ?, UTC_TIMESTAMP()))
+              OR (scope = ? AND last_failure_at <= TIMESTAMPADD(MINUTE, ?, UTC_TIMESTAMP()))
+            )',
+        ['identifier', -$identifierWindow, 'source', -$sourceWindow]
+    );
+
+    if (!is_array($stale) || (int) $stale['stale'] === 0) {
+        return;
     }
+
+    $db->execute(
+        'DELETE FROM login_attempts
+          WHERE (locked_until IS NULL OR locked_until <= UTC_TIMESTAMP())
+            AND last_failure_at IS NOT NULL
+            AND (
+                 (scope = ? AND last_failure_at <= TIMESTAMPADD(MINUTE, ?, UTC_TIMESTAMP()))
+              OR (scope = ? AND last_failure_at <= TIMESTAMPADD(MINUTE, ?, UTC_TIMESTAMP()))
+            )
+          LIMIT 100',
+        ['identifier', -$identifierWindow, 'source', -$sourceWindow]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The generic request throttle (issue-022 §7.2)
+//
+// The sign-in throttle above is a SPECIALISED counter: it counts FAILURES
+// and it serves a wait that grows. The reset and the registration screens
+// need a simpler thing — "how many requests has this key made in the last
+// hour" — and they need it for keys that match NO account.
+//
+// That is the whole point: a limiter that only counts against an existing
+// record is bypassable by typing something that does not exist. The reset
+// screen therefore counts against the SUBMITTED ADDRESS (known or not) and
+// against the SOURCE, and the registration screen counts against the
+// source.
+// ---------------------------------------------------------------------------
+
+if (!defined('RESET_ADDRESS_LIMIT')) {
+    /**
+     * The reset requests ONE address may make in a window (issue-022 §7.2).
+     *
+     * Three an hour: enough for a person who forgot their password twice,
+     * and far too few for a mail cannon. The counter is raised for a
+     * KNOWN address and for an UNKNOWN one alike, so the limit itself
+     * never says whether the address exists.
+     */
+    define('RESET_ADDRESS_LIMIT', 3);
+
+    /** The window of the per-address reset counter, in minutes. */
+    define('RESET_ADDRESS_WINDOW_MINUTES', 60);
+
+    /**
+     * The reset requests ONE source may make in a window (issue-022 §5).
+     *
+     * Higher than the per-address limit on purpose: a visitor behind a
+     * NAT shares the bucket, and the per-address counter is the one that
+     * stops the cannon. The source counter stops the spray.
+     */
+    define('RESET_SOURCE_LIMIT', 20);
+
+    /** The window of the per-source reset counter, in minutes. */
+    define('RESET_SOURCE_WINDOW_MINUTES', 60);
+
+    /**
+     * The registrations ONE source may make in a window (issue-022 §4).
+     *
+     * Ten an hour. Every one of them creates an account and a
+     * confirmation message, so the cost per request is real.
+     */
+    define('REGISTER_SOURCE_LIMIT', 10);
+
+    /** The window of the per-source registration counter, in minutes. */
+    define('REGISTER_SOURCE_WINDOW_MINUTES', 60);
+
+    /**
+     * How long a throttle row is kept after its window closed, in
+     * minutes.
+     *
+     * It is LONGER than every limiter window on purpose: a row that is
+     * pruned while its window is still open would lose the count and
+     * weaken the limiter. A day is long enough to keep the table small
+     * and short enough that a dead row does not linger.
+     */
+    define('REQUEST_THROTTLE_RETENTION_MINUTES', 1440);
+}
+
+/**
+ * Is the generic request throttle switched on?
+ *
+ * The kill switch is a CONFIGURATION constant (REQUEST_THROTTLE_ENABLED in
+ * config.php), not a product rule: it is the way an operator turns the
+ * limiter off if it ever misfires (issue-022 §10). The default is ON, and
+ * only a REAL boolean false turns it off — the string 'false' leaves the
+ * limiter on, because a limiter that fails open is the wrong way to fail.
+ */
+function requestThrottleEnabled(): bool
+{
+    if (!defined('REQUEST_THROTTLE_ENABLED')) {
+        return true;
+    }
+
+    return constant('REQUEST_THROTTLE_ENABLED') !== false;
+}
+
+/**
+ * The key of a request throttle.
+ *
+ * The sha256 of what is being counted, lower-cased and trimmed first: the
+ * table never stores what the visitor typed, and the hash is
+ * case-insensitive by construction, so "A@Example.test" and
+ * "a@example.test" share one counter.
+ */
+function requestThrottleKey(string $value): string
+{
+    return hash('sha256', strtolower(trim($value)));
+}
+
+/**
+ * The key of a SOURCE request throttle.
+ *
+ * The same peer key the sign-in throttle uses — the address that really
+ * opened the connection, never the one the visitor typed into a header.
+ * A limiter whose key the visitor chooses is a dial the visitor turns
+ * (issue-021 §4, issue-022 §7.2).
+ */
+function requestSourceKey(): string
+{
+    return loginSourceKey();
+}
+
+/**
+ * The state of ONE request counter.
+ *
+ * The count DECAYS: a counter whose window closed reads zero, so an
+ * attempt that happened yesterday costs nothing today. The window is not
+ * shortened while it is open, so the retry-after is the real one.
+ *
+ * @return array{hits: int, blocked: bool, retry_after: int}
+ */
+function requestCounterState(string $bucket, string $key, int $limit, int $windowMinutes): array
+{
+    $row = Database::getInstance()->fetchOne(
+        'SELECT hits, window_started_at
+           FROM request_throttles
+          WHERE bucket = ? AND key_hash = ?',
+        [$bucket, $key]
+    );
+
+    if (!is_array($row)) {
+        return ['hits' => 0, 'blocked' => false, 'retry_after' => 0];
+    }
+
+    $started = strtotime((string) $row['window_started_at'] . ' UTC');
+
+    if ($started === false) {
+        $started = time();
+    }
+
+    // The window has closed: the count has decayed away.
+    if ($started <= time() - ($windowMinutes * 60)) {
+        return ['hits' => 0, 'blocked' => false, 'retry_after' => 0];
+    }
+
+    $hits = (int) $row['hits'];
+
+    if ($hits < $limit) {
+        return ['hits' => $hits, 'blocked' => false, 'retry_after' => 0];
+    }
+
+    return [
+        'hits'        => $hits,
+        'blocked'     => true,
+        'retry_after' => max(1, ($started + ($windowMinutes * 60)) - time()),
+    ];
+}
+
+/**
+ * The state of a SET of request limiters.
+ *
+ * The stricter of the counters wins: the wait that ends LAST is the one
+ * served, and a counter that is not blocked never shortens the wait of
+ * the one that is. Never the sum — the same rule the sign-in throttle
+ * follows (issue-021 §8.1).
+ *
+ * @param array<int, array{0: string, 1: string, 2: int, 3: int}> $limiters
+ *        bucket, key, limit, window minutes — one entry per counter.
+ *
+ * @return array{blocked: bool, retry_after: int, hits: int}
+ */
+function requestThrottleState(array $limiters): array
+{
+    $blocked    = false;
+    $retryAfter = 0;
+    $hits       = 0;
+
+    foreach ($limiters as $limiter) {
+        [$bucket, $key, $limit, $windowMinutes] = $limiter;
+
+        $state = requestCounterState($bucket, $key, $limit, $windowMinutes);
+
+        $hits += $state['hits'];
+
+        if ($state['blocked']) {
+            $blocked = true;
+
+            $retryAfter = max($retryAfter, $state['retry_after']);
+        }
+    }
+
+    return ['blocked' => $blocked, 'retry_after' => $retryAfter, 'hits' => $hits];
+}
+
+/**
+ * Raise ONE request counter by one hit.
+ *
+ * The count is raised IN SQL — `hits = hits + 1` — so two hits that land
+ * together raise the counter by two and not by one. The window is reset
+ * in the same statement: a hit that arrives after the window closed
+ * starts a new one and the count goes back to 1, which is the decay.
+ *
+ * The two assignments are ORDERED so that both read the OLD
+ * window_started_at: the first one never writes that column, so the
+ * second one still sees the value the row had. The order therefore does
+ * not matter, and the statement is one round trip — the whole limiter is
+ * one statement per counter (issue-022 §11).
+ */
+function raiseRequestCounter(string $bucket, string $key, int $windowMinutes): void
+{
+    $db = Database::getInstance();
+
+    $db->execute(
+        'INSERT INTO request_throttles
+            (bucket, key_hash, hits, window_started_at)
+              VALUES (?, ?, 1, UTC_TIMESTAMP())
+         ON DUPLICATE KEY UPDATE
+              hits = IF(window_started_at <= TIMESTAMPADD(MINUTE, ?, UTC_TIMESTAMP()), 1, hits + 1),
+              window_started_at = IF(window_started_at <= TIMESTAMPADD(MINUTE, ?, UTC_TIMESTAMP()), UTC_TIMESTAMP(), window_started_at)',
+        [$bucket, $key, -$windowMinutes, -$windowMinutes]
+    );
+}
+
+/**
+ * Take one unit of quota from a set of counters.
+ *
+ * The counters are CONSULTED first and RAISED afterwards, and a request
+ * that was refused does NOT raise ANY of them: the window is not extended
+ * by the requests that were turned away — not by the counter that turned
+ * them away, and not by the other counters of the set either. So exactly
+ * `limit` requests are served per window, and the surplus is refused with
+ * a 429 (issue-022 §7.2).
+ *
+ * This is why the callers pass the WHOLE set in one call. Two calls — one
+ * per counter — would raise the first counter for a request the second
+ * counter refused, and a visitor behind a shared address would then lock
+ * out everybody else along with them.
+ *
+ * The refusal happens HERE, on the request path, before anything is
+ * queued — the refusal is what stops the mail cannon, so it cannot be
+ * left to the worker.
+ *
+ * @param array<int, array{0: string, 1: string, 2: int, 3: int}> $limiters
+ *
+ * @return array{blocked: bool, retry_after: int, hits: int}
+ */
+function takeRequestQuota(array $limiters): array
+{
+    if (!requestThrottleEnabled()) {
+        return ['blocked' => false, 'retry_after' => 0, 'hits' => 0];
+    }
+
+    $state = requestThrottleState($limiters);
+
+    if ($state['blocked']) {
+        return $state;
+    }
+
+    foreach ($limiters as $limiter) {
+        [$bucket, $key, , $windowMinutes] = $limiter;
+
+        raiseRequestCounter($bucket, $key, $windowMinutes);
+    }
+
+    return $state;
+}
+
+/**
+ * The limiters of the reset screen: the source.
+ *
+ * The source limiter bounds the SPRAY — the attacker who walks through a
+ * list of addresses, one request each.
+ *
+ * @return array<int, array{0: string, 1: string, 2: int, 3: int}>
+ */
+function resetSourceLimiters(): array
+{
+    return [
+        [
+            'reset:source',
+            requestSourceKey(),
+            (int) RESET_SOURCE_LIMIT,
+            (int) RESET_SOURCE_WINDOW_MINUTES,
+        ],
+    ];
+}
+
+/**
+ * The limiters of the reset screen: the submitted address.
+ *
+ * The address limiter is keyed on the SUBMITTED address, so it counts a
+ * known address and an unknown one alike — the ATTEMPT is what costs a
+ * mail, and the attempt is what the attacker controls. It is read
+ * TOGETHER with the source limiter, in one `takeRequestQuota()` call, so
+ * that a refusal by either of them raises neither: the source can be
+ * refused without touching the address's counter, and the other way round.
+ *
+ * @return array<int, array{0: string, 1: string, 2: int, 3: int}>
+ */
+function resetAddressLimiters(string $email): array
+{
+    return [
+        [
+            'reset:address',
+            requestThrottleKey($email),
+            (int) RESET_ADDRESS_LIMIT,
+            (int) RESET_ADDRESS_WINDOW_MINUTES,
+        ],
+    ];
+}
+
+/**
+ * The limiters of the registration screen: the source.
+ *
+ * There is no per-address limiter here: a registration is refused anyway
+ * when the address is taken, and the per-source limiter is what bounds
+ * the accounts an attacker can create.
+ *
+ * @return array<int, array{0: string, 1: string, 2: int, 3: int}>
+ */
+function registerRequestLimiters(): array
+{
+    return [
+        [
+            'register:source',
+            requestSourceKey(),
+            (int) REGISTER_SOURCE_LIMIT,
+            (int) REGISTER_SOURCE_WINDOW_MINUTES,
+        ],
+    ];
+}
+
+/**
+ * Remove the rows whose window closed long ago.
+ *
+ * Without this the table grows at the rate of the network: one row per
+ * address anybody ever typed, kept forever. The delete is bounded, and
+ * the probe in front of it keeps the statement off the hot path.
+ *
+ * The retention window is LONGER than every limiter window, so a row is
+ * never pruned while its counter is still counting.
+ */
+function pruneRequestThrottles(): void
+{
+    $db = Database::getInstance();
+
+    $stale = $db->fetchOne(
+        'SELECT COUNT(*) AS stale
+           FROM request_throttles
+          WHERE window_started_at <= TIMESTAMPADD(MINUTE, ?, UTC_TIMESTAMP())',
+        [-(int) REQUEST_THROTTLE_RETENTION_MINUTES]
+    );
+
+    if (!is_array($stale) || (int) $stale['stale'] === 0) {
+        return;
+    }
+
+    $db->execute(
+        'DELETE FROM request_throttles
+          WHERE window_started_at <= TIMESTAMPADD(MINUTE, ?, UTC_TIMESTAMP())
+          LIMIT 100',
+        [-(int) REQUEST_THROTTLE_RETENTION_MINUTES]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +1422,7 @@ function consumePasswordReset(string $token, string $newPassword): array
             $pdo->rollBack();
         }
 
-        error_log('[auth] the password reset failed: ' . $ex->getMessage());
+        logFailure('auth: the password reset failed', $ex);
 
         return ['status' => 'error'];
     }
@@ -826,7 +1512,7 @@ function consumeEmailVerification(string $token): ?int
             $pdo->rollBack();
         }
 
-        error_log('[auth] the e-mail verification failed: ' . $ex->getMessage());
+        logFailure('auth: the e-mail verification failed', $ex);
 
         return null;
     }

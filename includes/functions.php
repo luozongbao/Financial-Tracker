@@ -23,12 +23,21 @@
  *      formatSignedMoney() — never inside number_format(), which renders a
  *      negative with an ASCII hyphen. The typographic minus (U+2212) is the
  *      glyph the design uses.
+ *   8. The security headers live in ONE function — sendSecurityHeaders() —
+ *      and BOTH entry points call it. The application is CSP-clean by
+ *      construction, so the policy is strict: no 'unsafe-inline', no
+ *      nonce (issue-024).
  *
  * Configuration comes from config.php and from nothing else — no getenv(),
  * no $_ENV, no $_SERVER-based configuration.
  */
 
 declare(strict_types=1);
+
+// The sanitised error log. It is a thin wrapper around error_log() with no
+// dependencies of its own, so the helpers below can report a failure
+// through the ONE place that decides what a log line is allowed to hold.
+require_once __DIR__ . '/logging.php';
 
 /**
  * A failure that carries an HTTP status code.
@@ -203,6 +212,94 @@ function absoluteUrl(string $path): string
 }
 
 // ---------------------------------------------------------------------------
+// Response headers
+// ---------------------------------------------------------------------------
+
+/**
+ * The security headers every document response carries.
+ *
+ * BOTH entry points call this: index.php for the application, install.php
+ * for the wizard. Two copies of the list would drift apart, and the wizard
+ * is exactly the page that receives the database password and the SMTP
+ * password (issue-024 §6).
+ *
+ * The caller must invoke this BEFORE the first byte of output:
+ * output_buffering is 0 in this stack, and a header() call after the body
+ * has started is a SILENT failure — a dropped security header looks
+ * exactly like a security header that was never added.
+ *
+ * The policy is strict on purpose. The application has no inline script,
+ * no inline style, no inline event handler and no third-party origin, so
+ * it needs neither 'unsafe-inline' nor a nonce — and a nonce would make
+ * the header dynamic on every request for no gain.
+ *
+ * HSTS and Upgrade-Insecure-Requests are HTTPS-only. A plain-HTTP
+ * installation (a box on the LAN) is a supported deployment, and a browser
+ * that has been told to expect HTTPS refuses to talk to a host that does
+ * not (issue-024 §4).
+ */
+function sendSecurityHeaders(): void
+{
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: SAMEORIGIN');
+    header('Referrer-Policy: same-origin');
+
+    // The Content-Security-Policy. Strict on purpose:
+    //
+    //   script-src 'self'  — the only script tag is /assets/js/app.js
+    //   style-src  'self'  — the four stylesheets are <link> tags, and
+    //                         there is not one style="" attribute
+    //   img-src    'self' data: — no raster asset exists yet
+    //   connect-src 'self' — app.js never opens a connection
+    //   object-src 'none' — no plugin, ever
+    //   base-uri  'none'   — a <base> tag would re-point every relative URL
+    //   form-action 'self' — every form posts to this origin
+    //   frame-ancestors 'self' — with X-Frame-Options, for the browsers
+    //                         that only understand the old header
+    //
+    // style-src 'self' blocks an inline style ATTRIBUTE as well as a
+    // <style> block. That is intended: the stylesheets carry every rule.
+    header(
+        "Content-Security-Policy: default-src 'self'; "
+        . "script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        . "font-src 'self'; connect-src 'self'; object-src 'none'; "
+        . "base-uri 'none'; form-action 'self'; frame-ancestors 'self'"
+    );
+
+    // Only WELL-KNOWN feature names. The specification says an
+    // unrecognised name makes the header a parse error, and a header that
+    // fails to parse is ignored IN ITS ENTIRETY — one typo would silently
+    // disable every feature in the list.
+    //
+    // The application uses no browser capability that needs a permission,
+    // so a deny-by-default list is free.
+    header(
+        "Permissions-Policy: accelerometer=(), autoplay=(), camera=(), "
+        . "display-capture=(), encrypted-media=(), fullscreen=(), "
+        . "geolocation=(), gyroscope=(), magnetometer=(), microphone=(), "
+        . "midi=(), payment=(), picture-in-picture=(), "
+        . "publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), "
+        . "usb=(), xr-spatial-tracking=()"
+    );
+
+    header('Cross-Origin-Opener-Policy: same-origin');
+    header('Cross-Origin-Resource-Policy: same-origin');
+    header('X-Permitted-Cross-Domain-Policies: none');
+
+    // The HTTPS-only pair. A plain-HTTP installation is explicitly
+    // supported, and a browser that has been told to expect HTTPS will
+    // refuse every subsequent request to a host that does not speak it.
+    //
+    // includeSubDomains and preload are deliberately ABSENT: they commit
+    // every subdomain, and preload commits the domain to the browser
+    // vendors' list. Both belong to the operator who owns the domain.
+    if (requestIsHttps()) {
+        header('Strict-Transport-Security: max-age=31536000');
+        header('Upgrade-Insecure-Requests: 1');
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session and CSRF
 // ---------------------------------------------------------------------------
 
@@ -225,6 +322,151 @@ function requestIsHttps(): bool
 }
 
 /**
+ * The directory the session files are written to.
+ *
+ * The shared /tmp is the wrong place for a session file:
+ *
+ *   - On a native installation it is the HOST's /tmp: shared by every
+ *     process of every user on the box, and world-readable.
+ *   - The NAME of the file is the session id, so a directory listing hands
+ *     out the live session ids of the visitors.
+ *
+ * The candidates, in order:
+ *
+ *   1. SESSION_SAVE_PATH from config.php — the operator's choice. It is a
+ *      constant and not an environment variable, because config.php is the
+ *      only configuration source of this application.
+ *   2. <project root>/storage/sessions — the default. This file lives in
+ *      includes/, so dirname(__DIR__) is the project root.
+ *   3. The php.ini default, when the host has one.
+ *   4. A private directory under the system temporary directory.
+ *
+ * The directory is created with mode 0700 when it is missing, and a SYMLINK
+ * is refused: a symlink at that path would let anybody who can write the
+ * parent point the session files at a directory they can read.
+ *
+ * The value is resolved once per request and then reused — the ini setting
+ * is read before startSession() changes it.
+ */
+function sessionSavePath(): string
+{
+    static $resolved = null;
+
+    if ($resolved !== null) {
+        return $resolved;
+    }
+
+    $candidates = [];
+
+    if (defined('SESSION_SAVE_PATH')) {
+        $configured = trim((string) SESSION_SAVE_PATH);
+
+        if ($configured !== '') {
+            $candidates[] = $configured;
+        }
+    }
+
+    $candidates[] = dirname(__DIR__) . '/storage/sessions';
+
+    // The php.ini default, when the host has one. It is only accepted when
+    // it is private: /var/lib/php/sessions on a stock Debian is 0700, and
+    // the shared /tmp is not.
+    $ini = trim((string) ini_get('session.save_path'));
+
+    if ($ini !== '') {
+        $candidates[] = $ini;
+    }
+
+    // A private directory under the system temporary directory. The name
+    // carries the uid and the directory itself is 0700, so another user on
+    // the same box cannot read it.
+    $candidates[] = rtrim(sys_get_temp_dir(), '/') . '/ft-sessions-' . getmyuid();
+
+    foreach ($candidates as $candidate) {
+        $path = sessionPrivateDirectory($candidate);
+
+        if ($path !== '') {
+            $resolved = $path;
+
+            return $path;
+        }
+    }
+
+    // Nothing private could be created. The ini default is the last resort:
+    // a session that does not start at all would leave the application
+    // unusable, and a host that cannot write anywhere is the operator's
+    // problem to fix.
+    logFailure('session: no private session directory could be created');
+
+    $resolved = (string) ini_get('session.save_path');
+
+    return $resolved;
+}
+
+/**
+ * A private directory for the session files, or an empty string.
+ *
+ * The directory is created when it is missing, with mode 0700. A symlink —
+ * at the path itself or at its parent — is refused: the session files would
+ * be written wherever the symlink points, and that is a place the owner of
+ * the symlink chose.
+ *
+ * A directory that is readable by anybody else is refused as well. The mode
+ * is corrected when it is too wide, and the directory is only accepted when
+ * the correction worked.
+ */
+function sessionPrivateDirectory(string $path): string
+{
+    if ($path === '' || is_link($path)) {
+        return '';
+    }
+
+    if (!is_dir($path)) {
+        $parent = dirname($path);
+
+        if (!is_dir($parent)) {
+            // The parent may be missing as well: the application creates
+            // its own storage directory the first time it runs.
+            if (!@mkdir($parent, 0700, true) && !is_dir($parent)) {
+                return '';
+            }
+
+            @chmod($parent, 0700);
+        }
+
+        // A symlinked parent is refused: the session files would be
+        // written wherever the symlink points, and that is a place the
+        // owner of the symlink chose.
+        if (is_link($parent)) {
+            return '';
+        }
+
+        if (!@mkdir($path, 0700)) {
+            return '';
+        }
+
+        @chmod($path, 0700);
+    }
+
+    if (!is_writable($path)) {
+        return '';
+    }
+
+    $mode = @fileperms($path);
+
+    if ($mode !== false && ($mode & 0077) !== 0) {
+        @chmod($path, 0700);
+        $mode = @fileperms($path);
+
+        if ($mode !== false && ($mode & 0077) !== 0) {
+            return '';
+        }
+    }
+
+    return $path;
+}
+
+/**
  * Start the session.
  *
  * This is the FIRST call in every request. It opens ob_start() because
@@ -244,10 +486,29 @@ function requestIsHttps(): bool
                   the LAN, a reverse proxy in front) would otherwise
  *                  never get its session cookie back and every request
  *                  would land on the sign-in screen.
+ *
+ * Two settings protect the session FILE itself (issue-025 7.2 and 7.3):
+ *
+ *   - session.use_strict_mode -- an UNKNOWN session id is never adopted.
+ *     Without it a client may choose the id, and the id is the name of the
+ *     file its session is written to: a client that sends
+ *     "PHPSESSID=secret" gets its own data written into a file it named.
+ *   - session.save_path -- the session files are written to a private
+ *     directory of this application and not to the shared /tmp.
  */
 function startSession(): void
 {
     if (session_status() === PHP_SESSION_NONE) {
+        // Both settings have to be in place BEFORE the session starts: PHP
+        // reads them when it opens the session, not afterwards.
+        ini_set('session.use_strict_mode', '1');
+
+        $savePath = sessionSavePath();
+
+        if ($savePath !== '') {
+            ini_set('session.save_path', $savePath);
+        }
+
         session_set_cookie_params([
             'lifetime' => 0,
             'path'     => '/',
@@ -774,8 +1035,13 @@ function reportBucketExpression(string $grain): string
 
     // A week that starts on Tuesday, Wednesday, Thursday, Friday or
     // Saturday: the offset is the number of days since the week start.
-    // The day number is the config constant, never a request value.
-    return 'DATE_SUB(occurred_on, INTERVAL ((DAYOFWEEK(occurred_on) - ' . $start . ' + 7) MOD 7) DAY)';
+    // The day number is MARIA'S, not the config constant's: DAYOFWEEK
+    // counts 1 = Sunday ... 7 = Saturday, while WEEK_START counts
+    // 1 = Monday ... 7 = Sunday. The two numberings differ by one for
+    // every day except Sunday, so the config constant here quietly
+    // produced a week that started on Monday.
+    return 'DATE_SUB(occurred_on, INTERVAL ((DAYOFWEEK(occurred_on) - '
+        . reportWeekStartDayNumber($start) . ' + 7) MOD 7) DAY)';
 }
 
 /**
@@ -844,6 +1110,160 @@ function formatShare(float $share): string
 function formatIncomeMoney(string $amount): string
 {
     return '+' . formatMoney(ltrim(trim($amount), '+-'));
+}
+
+/**
+ * The unit an average is taken per.
+ *
+ * The unit is the visitor's choice and it arrives in the query string,
+ * so this function is the ONE place that decides what a unit is. The
+ * list is closed: four names, nothing else. An unknown unit — a typo, a
+ * crawler, a hand-edited URL — falls back to "day", the unit that is
+ * meaningful for every range.
+ *
+ * The returned value is a LITERAL from the list. It is never
+ * interpolated into SQL and never echoed back to the visitor: a unit
+ * that is not on the list does not exist.
+ */
+function normalizeAverageUnit(string $unit): string
+{
+    $unit = strtolower(trim($unit));
+
+    return in_array($unit, ['day', 'week', 'month', 'year'], true) ? $unit : 'day';
+}
+
+/**
+ * The day a week starts on, in MariaDB's numbering.
+ *
+ * MariaDB counts the days 1 = Sunday ... 7 = Saturday, while WEEK_START
+ * counts 1 = Monday ... 7 = Sunday and 0 = Sunday. The two numberings
+ * differ by one for every day except Sunday, and mixing them is how a
+ * week that is configured to start on Tuesday quietly becomes a week
+ * that starts on Monday.
+ *
+ * The number is computed here, in ONE place, so the SQL bucket
+ * expression and the PHP week count cannot disagree about what a week
+ * is.
+ *
+ * @param int|null $start The week start day; null reads WEEK_START.
+ */
+function reportWeekStartDayNumber(?int $start = null): int
+{
+    $day = $start ?? weekStartDay();
+
+    if ($day === 0 || $day === 7) {
+        // Sunday, in either numbering.
+        return 1;
+    }
+
+    // Monday is 2 in MariaDB, Tuesday is 3, ... Saturday is 7.
+    return $day + 1;
+}
+
+/**
+ * The first day of the week a date falls into.
+ *
+ * The PHP twin of reportBucketExpression('week'): the same WEEK_START
+ * constant and the same rule, so the number of weeks in a range and
+ * the week buckets of the "Over time" table are the same weeks.
+ *
+ * @return string The week start, YYYY-MM-DD.
+ */
+function reportWeekStart(string $date): string
+{
+    $ts = strtotime($date . ' UTC');
+
+    if ($ts === false) {
+        return $date;
+    }
+
+    // The week start, in the ISO numbering (1 = Monday ... 7 = Sunday).
+    $isoStart = (reportWeekStartDayNumber() + 5) % 7 + 1;
+
+    // The day of the week, in the same numbering.
+    $isoDay = (int) gmdate('N', $ts);
+
+    $offset = ($isoDay - $isoStart + 7) % 7;
+
+    return gmdate('Y-m-d', $ts - $offset * 86400);
+}
+
+/**
+ * The number of calendar units in a range — the denominator of the
+ * average.
+ *
+ * The denominator is the CALENDAR, never the rows that happen to
+ * exist: a month that touches five weeks is five weeks even when two
+ * of them hold nothing, and a year is twelve months even when three of
+ * them do. An average that divided by the number of rows would answer
+ * a different question.
+ *
+ * The four units:
+ *
+ *   day   the number of days in the range, inclusive on both ends;
+ *   week  the number of week buckets the range touches — a partial
+ *         first week counts, and the weeks follow WEEK_START;
+ *   month the number of distinct (year, month) pairs the range
+ *         touches;
+ *   year  the number of distinct years the range touches.
+ *
+ * A range that ends before it starts has no units: the count is zero,
+ * and the caller must not divide by it.
+ */
+function reportUnitCount(string $from, string $to, string $unit): int
+{
+    $unit = normalizeAverageUnit($unit);
+
+    $fromTs = strtotime($from . ' UTC');
+    $toTs   = strtotime($to . ' UTC');
+
+    if ($fromTs === false || $toTs === false || $toTs < $fromTs) {
+        return 0;
+    }
+
+    if ($unit === 'day') {
+        return reportSpanDays($from, $to);
+    }
+
+    if ($unit === 'week') {
+        $first = strtotime(reportWeekStart($from) . ' UTC');
+        $last  = strtotime(reportWeekStart($to) . ' UTC');
+
+        if ($first === false || $last === false) {
+            return 0;
+        }
+
+        // Both ends are week starts, so the difference is a whole
+        // number of weeks.
+        return intdiv($last - $first, 604800) + 1;
+    }
+
+    if ($unit === 'month') {
+        $fromYear  = (int) gmdate('Y', $fromTs);
+        $fromMonth = (int) gmdate('n', $fromTs);
+        $toYear    = (int) gmdate('Y', $toTs);
+        $toMonth   = (int) gmdate('n', $toTs);
+
+        return ($toYear - $fromYear) * 12 + ($toMonth - $fromMonth) + 1;
+    }
+
+    // The year.
+    return ((int) gmdate('Y', $toTs)) - ((int) gmdate('Y', $fromTs)) + 1;
+}
+
+/**
+ * Format an average, with the unit named next to the figure.
+ *
+ * The unit is part of the reading: "27.35 per day" says what the
+ * number is, and the screen must never show a bare average.
+ *
+ * The sign is the caller's, exactly as on the tiles: the income is
+ * signed with "+", the spending with the minus sign, and the net with
+ * the sign the database gave. A zero carries no sign.
+ */
+function formatAverageMoney(string $amount, string $unit, string $sign): string
+{
+    return formatSignedMoney($amount, $sign) . ' per ' . normalizeAverageUnit($unit);
 }
 
 // ---------------------------------------------------------------------------
@@ -1749,4 +2169,28 @@ function safeRedirectTarget(?string $uri): string
     }
 
     return $uri;
+}
+
+// ---------------------------------------------------------------------------
+// Refusing
+// ---------------------------------------------------------------------------
+
+/**
+ * Refuse a request that has run out of quota.
+ *
+ * The status is 429 and the header is Retry-After: the number of seconds
+ * the caller has to wait before trying again (issue-022 §7.2).
+ *
+ * Both must happen BEFORE the first byte of the body — PHP drops a header
+ * that is sent after the output has started, and a 429 without the header
+ * is a 429 the client cannot schedule against.
+ *
+ * The BODY is the view's business, and it must be the same body for every
+ * address: the refusal must not tell a caller more than "you are early".
+ */
+function refuseRateLimited(int $retryAfterSeconds): void
+{
+    http_response_code(429);
+
+    header('Retry-After: ' . max(1, $retryAfterSeconds));
 }

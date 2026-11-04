@@ -37,12 +37,33 @@ const SMTP_PASS = 'your_email_password';
 const MAIL_FROM = 'no-reply@example.com';
 const MAIL_FROM_NAME = 'Financial Tracker';
 
+// ---- Session --------------------------------------------------------------
+
+// Where the session files are written.
+//
+// The session file is written by PHP's file handler, and its name is the
+// session id. The shared /tmp of the host is the wrong place for it: the
+// directory is world-readable, so a listing hands out the live session ids
+// of the visitors. This directory is created with mode 0700 when it is
+// missing, and the web-root deny block refuses it.
+//
+// The value is a code expression, not a plain path, so the project can be
+// moved after the install. The wizard uses the same directory before
+// config.php exists — see issue-025 §7.3.
+const SESSION_SAVE_PATH = __DIR__ . '/storage/sessions';
+
 // ---- Application ----------------------------------------------------------
 
 // Public registration. true = the register page is open; false = it is closed
 // on BOTH the front end (403, no form) and the back end (the POST handler
 // rejects the request).
 const ALLOW_REGISTRATION = true;
+
+// The request throttle — the limiter that guards /register and
+// /forgot-password (issue-022 §7.2). true = the limiter is on; false = it
+// is off. It is the kill switch for an operator whose visitors are being
+// blocked by it.
+const REQUEST_THROTTLE_ENABLED = true;
 
 // Week-start rule for period reports, as a weekday number: 1 = Monday ... 7 = Sunday.
 // Keep it in exactly one place so the reports and the UI always agree.

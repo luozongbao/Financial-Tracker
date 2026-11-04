@@ -1,4 +1,4 @@
-This project is to record spending andd income for personall use. it should be able to search and sum in time period like day, month, weeks, year.
+This project is to record spending andd income for personal use. it should be able to search and sum/average in time period like day, month, weeks, year.
 
 ## stack
 
@@ -7,10 +7,42 @@ This project is to record spending andd income for personall use. it should be a
 - db: mariadb
 - docker is used for development, can be used for production but not depend on docker.
 
+## Searching, summing and averaging
+
+the reports screen answers the first line of this brief. it sums the income and the spending over a period - a day, a week, a month, a year or a custom range - and it divides the total by the number of calendar units in the period, so the average is there too.
+
+the unit is the visitor's choice and it does not have to match the period: a month can be read per day, per week, per month or per year, and the figure names its own unit (`−27.35 per day`). the denominator is the calendar, never the number of recorded transactions - thirty-one days stay thirty-one days when only three of them have transactions on them.
+
+the division is done in the database, in decimal, with the denominator sent as a parameter. there is no AVG() and no float arithmetic anywhere in the path. the net average is derived from the two rounded sides, so the three figures always reconcile.
+
 ## Installation
 1. search for config.php if exist goto index.php
 2. if not install
 3. install create config.php, allow user to customize database name, database user, database password, smtp server, smtp port, email user, smtp password
 4. config.php also included ALLOW_REGISTRATION default true, allow user registration. if set to false don't allow user registration, both FE/BE are restricted.
 
-## 
+## Running it
+
+the application never sends mail by itself. a reset link or a verification mail is written to a queue table (mail_outbox) and a worker sends it. the worker is part of the installation, not an optional extra:
+
+```
+php database/outbox_worker.php --limit=20
+```
+
+run it from cron (every minute or every five minutes is enough). without it, no mail is sent and the messages wait in the queue. the queue depth is shown in the installation card in settings, so a backlog is visible without reading a log.
+
+the worker claims each message exclusively, so two runs at the same time never send the same message twice; a failed send is retried with the same row and a growing wait.
+
+## Security notes
+
+the unauthenticated screens are limited. the reset screen allows 3 requests per hour for one submitted address and 20 per hour per source address; the register screen allows 10 registrations per hour per source address. the surplus is refused with 429 and a Retry-After header. the limits are constants in config.php (RESET_ADDRESS_LIMIT, RESET_SOURCE_LIMIT, REGISTER_SOURCE_LIMIT) and REQUEST_THROTTLE_ENABLED turns the whole thing off in an emergency.
+
+the reset screen answers the same way for every address, so it cannot be used to find out which addresses have an account. the answers are byte-identical and the timing is the same. the logs carry the context of a failure and never the address that was submitted.
+
+the web root is the repository root, so the deny block in .htaccess is load-bearing. it refuses .env, .git, database/, includes/, views/, docker/, vendor/, storage/, composer.json, composer.lock and docs/issues/ - and, since issue-023, docker-compose.yml, config.template.php, AGENTS.md and everything under docs/ except the mockup deliverable. the development stack's default credentials are therefore not published by the web server. the liteSpeed webadmin is bound to 127.0.0.1 only, and the phpMyAdmin and nginx images are pinned by digest.
+
+the session files are not written to the shared /tmp. they live in storage/sessions/ under the application root, created with mode 0700, and the location is configurable with the SESSION_SAVE_PATH constant in config.php. the deny block refuses the directory, because the name of a session file is the session id and a listing would hand out the live sessions of the visitors. the session id is regenerated when the sign-in happens, when the sign-out happens, at the start of the install wizard and after every step of it; session.use_strict_mode is 1, so an id the client invents is not adopted and no file is created under that name.
+
+the installer holds no secret. the wizard asks for the database password and the smtp password, proves them, and asks for them again on the last step, in empty fields - it never writes a password into the session, and the one function that writes the session state drops both passwords before the write. the config.php that is written holds the password exactly as it was typed, spaces included.
+
+every response carries the hardening headers. the set lives in one function, sendSecurityHeaders() in includes/functions.php, and both entry points call it - the application and the installer - so the installer is not the weak one. the set is x-content-type-options, x-frame-options, referrer-policy, a strict content-security-policy (script-src 'self', style-src 'self', object-src 'none', base-uri 'none', form-action 'self', frame-ancestors 'self'), a permissions-policy that switches every feature off, cross-origin-opener-policy, cross-origin-resource-policy and x-permitted-cross-domain-policies. strict-transport-security and upgrade-insecure-requests are sent only over https. there is no unsafe-inline and no nonce, because the application has no inline script - the theme travels in a cookie - and there is no x-xss-protection, because the browsers that honoured it are the ones it broke.
