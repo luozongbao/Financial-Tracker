@@ -337,7 +337,7 @@ echo "\n== C. A GET form carries no CSRF token ==\n";
 $r = req('GET', BASE . '/transactions/new', [], $jar);
 $r = req('POST', BASE . '/transactions/save', [
     'csrf_token' => csrf($r['body']), 'type' => 'expense', 'amount' => '11.00',
-    'date' => '2026-10-23', 'description' => 'seed ' . $marker,
+    'date' => date('Y-m-d'), 'description' => 'seed ' . $marker,
 ], $jar);
 
 $checked = 0;
@@ -384,7 +384,7 @@ ok('the escaped form is present', str_contains($r['body'], '&lt;script&gt;'));
 $r = req('GET', BASE . '/transactions/new', [], $jar);
 $r = req('POST', BASE . '/transactions/save', [
     'csrf_token' => csrf($r['body']), 'type' => 'expense', 'amount' => '5.00',
-    'date' => '2026-10-22', 'description' => 'Quote " and \' and <b> ' . $marker,
+    'date' => date('Y-m-d'), 'description' => 'Quote " and \' and <b> ' . $marker,
 ], $jar);
 $r = req('GET', BASE . '/transactions', [], $jar);
 ok('a quote in a description is escaped', !str_contains($r['body'], '<b> ' . $marker)

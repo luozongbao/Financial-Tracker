@@ -79,12 +79,11 @@ if (!defined('LOGIN_ATTEMPT_LIMIT')) {
     define('LOGIN_ATTEMPT_LIMIT', 5);
 
     /**
-     * How long the wait lasts, in minutes (issue-016 §6) — and, since
-     * issue-021 §8, also the QUIET WINDOW.
+     * How long the first wait lasts, in minutes (issue-016 §6).
      *
-     * A failure older than this does not count towards the limit any more,
-     * so the counter is "the failures of the last fifteen minutes" and an
-     * attacker cannot hold the lock open by coming back once an hour.
+     * The account's quiet window is LOGIN_BACKOFF_MAX_MINUTES, not this value:
+     * with a window equal to the wait, the counter resets as the lock ends and
+     * the escalation is unreachable (issue-021 DEFECT-1).
      */
     define('LOGIN_LOCK_MINUTES', 15);
 
@@ -734,7 +733,7 @@ function loginThrottleState(string $identifier): array
     $identifierCounter = loginCounterState(
         'identifier',
         loginIdentifierKey($identifier),
-        (int) LOGIN_LOCK_MINUTES
+        (int) LOGIN_BACKOFF_MAX_MINUTES
     );
 
     $sourceCounter = loginCounterState(
@@ -841,7 +840,7 @@ function recordLoginFailure(string $identifier): void
         'identifier',
         loginIdentifierKey($identifier),
         (int) LOGIN_ATTEMPT_LIMIT,
-        (int) LOGIN_LOCK_MINUTES
+        (int) LOGIN_BACKOFF_MAX_MINUTES
     );
 
     loginRaiseCounter(
@@ -911,7 +910,7 @@ function pruneLoginAttempts(): void
 {
     $db = Database::getInstance();
 
-    $identifierWindow = (int) LOGIN_LOCK_MINUTES;
+    $identifierWindow = (int) LOGIN_BACKOFF_MAX_MINUTES;
     $sourceWindow    = (int) LOGIN_SOURCE_WINDOW_MINUTES;
 
     $stale = $db->fetchOne(

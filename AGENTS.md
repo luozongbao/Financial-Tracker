@@ -149,7 +149,7 @@ verified. Read [docs/issues/README.md](docs/issues/README.md) for the index.
   **Implemented and verified.** The whole set — a strict
   `Content-Security-Policy` with **no** `unsafe-inline` and **no** nonce, a
   conditional `Strict-Transport-Security` and `Upgrade-Insecure-Requests`, a
-  19-feature `Permissions-Policy`, COOP, CORP and
+  18-feature `Permissions-Policy`, COOP, CORP and
   `X-Permitted-Cross-Domain-Policies` — lives in **one** function,
   `sendSecurityHeaders()`, that **both** entry points call, so the installer
   carries the same set as the application. **The implementation found one
@@ -739,7 +739,7 @@ paint**, and the application has **no inline script** while the server cannot re
 
 `sendSecurityHeaders()` in `includes/functions.php` holds the **whole** set —
 `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, a strict
-`Content-Security-Policy`, a 19-feature `Permissions-Policy`, COOP, CORP,
+`Content-Security-Policy`, an 18-feature `Permissions-Policy`, COOP, CORP,
 `X-Permitted-Cross-Domain-Policies`, and the conditional HSTS pair.
 
 - **Exactly two call sites**: `index.php` and `install.php`. A third entry

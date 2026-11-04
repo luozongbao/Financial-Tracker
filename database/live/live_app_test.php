@@ -219,7 +219,7 @@ ok('the dashboard carries the app nav', str_contains($r['body'], 'bottom-nav__li
 echo "\n== 4. CSRF ==\n";
 $r = req('POST', BASE . '/transactions/save', [
     'csrf_token' => str_repeat('0', 64), 'type' => 'expense', 'amount' => '10.00',
-    'date' => '2026-10-20', 'description' => 'csrf probe',
+    'date' => date('Y-m-d'), 'description' => 'csrf probe',
 ], $jarA);
 ok('POST /transactions/save with a bad CSRF token does not create the row',
     !str_contains($r['body'], 'csrf probe'), 'status=' . $r['status']);
@@ -243,7 +243,7 @@ $r = req('GET', BASE . '/transactions/new', [], $jarA);
 ok('GET /transactions/new -> 200', $r['status'] === 200, 'status=' . $r['status']);
 $r = req('POST', BASE . '/transactions/save', [
     'csrf_token' => csrf($r['body']), 'type' => 'expense', 'amount' => '123.45',
-    'date' => '2026-10-20', 'category_id' => $catId, 'description' => 'Weekly shop ' . $marker,
+    'date' => date('Y-m-d'), 'category_id' => $catId, 'description' => 'Weekly shop ' . $marker,
 ], $jarA);
 ok('POST /transactions/save (expense) -> 303', $r['status'] === 303, 'status=' . $r['status']);
 ok('POST /transactions/save (expense) -> Location /transactions', str_contains($r['location'], '/transactions'), $r['location']);
@@ -251,7 +251,7 @@ ok('POST /transactions/save (expense) -> Location /transactions', str_contains($
 $r = req('GET', BASE . '/transactions/new', [], $jarA);
 $r = req('POST', BASE . '/transactions/save', [
     'csrf_token' => csrf($r['body']), 'type' => 'income', 'amount' => '5000.00',
-    'date' => '2026-10-21', 'description' => 'Salary ' . $marker,
+    'date' => date('Y-m-d'), 'description' => 'Salary ' . $marker,
 ], $jarA);
 ok('POST /transactions/save (income) -> 303', $r['status'] === 303, 'status=' . $r['status']);
 
@@ -277,7 +277,7 @@ if ($txId !== '') {
     ok('the edit form is pre-filled', str_contains($r['body'], 'Weekly shop ' . $marker));
     $r = req('POST', BASE . '/transactions/save', [
         'csrf_token' => csrf($r['body']), 'id' => $txId, 'type' => 'expense', 'amount' => '99.99',
-        'date' => '2026-10-20', 'category_id' => $catId, 'description' => 'Weekly shop EDITED ' . $marker,
+        'date' => date('Y-m-d'), 'category_id' => $catId, 'description' => 'Weekly shop EDITED ' . $marker,
     ], $jarA);
     ok('POST /transactions/save (edit) -> 303', $r['status'] === 303, 'status=' . $r['status']);
     $r = req('GET', BASE . '/transactions', [], $jarA);
@@ -307,17 +307,17 @@ ok('user A transaction still exists after user B tried to delete it', str_contai
 echo "\n== 8. Reports ==\n";
 $r = req('GET', BASE . '/reports', [], $jarA);
 ok('GET /reports -> 200', $r['status'] === 200, 'status=' . $r['status']);
-$r = req('GET', BASE . '/reports?period=month&date=2026-10-01', [], $jarA);
+$r = req('GET', BASE . '/reports?period=month&date=' . date('Y-m-01'), [], $jarA);
 ok('GET /reports?period=month -> 200', $r['status'] === 200, 'status=' . $r['status']);
 ok('the report shows the income figure', str_contains($r['body'], '5,000') || str_contains($r['body'], '5000'), 'no 5,000 in the report');
 ok('the report shows the expense figure', str_contains($r['body'], '99.99'));
-$r = req('GET', BASE . '/reports?period=year&date=2026-01-01', [], $jarA);
+$r = req('GET', BASE . '/reports?period=year&date=' . date('Y-01-01'), [], $jarA);
 ok('GET /reports?period=year -> 200', $r['status'] === 200, 'status=' . $r['status']);
-$r = req('GET', BASE . '/reports?period=day&date=2026-10-20', [], $jarA);
+$r = req('GET', BASE . '/reports?period=day&date=' . date('Y-m-d'), [], $jarA);
 ok('GET /reports?period=day -> 200', $r['status'] === 200, 'status=' . $r['status']);
-$r = req('GET', BASE . '/reports?period=week&date=2026-10-19', [], $jarA);
+$r = req('GET', BASE . '/reports?period=week&date=' . date('Y-m-d'), [], $jarA);
 ok('GET /reports?period=week -> 200', $r['status'] === 200, 'status=' . $r['status']);
-$r = req('GET', BASE . '/reports?period=month&from=2026-10-01&to=2026-10-31', [], $jarA);
+$r = req('GET', BASE . '/reports?period=month&from=' . date('Y-m-01') . '&to=' . date('Y-m-t'), [], $jarA);
 ok('GET /reports custom range -> 200', $r['status'] === 200, 'status=' . $r['status']);
 $r = req('GET', BASE . '/reports?period=bogus', [], $jarA);
 ok('GET /reports with a bogus period does not 500', $r['status'] === 200 || $r['status'] === 302, 'status=' . $r['status']);
@@ -724,7 +724,7 @@ $r = req('GET', BASE . '/transactions/new', [], $jarTheme);
 $token = csrf($r['body']);
 $r = req('POST', BASE . '/transactions/save', [
     'csrf_token' => $token, 'type' => 'expense', 'amount' => '12.34',
-    'date' => '2026-10-22', 'description' => 'CSP form probe ' . $marker,
+    'date' => date('Y-m-d'), 'description' => 'CSP form probe ' . $marker,
 ], $jarTheme);
 ok('a form still submits under the policy', $r['status'] === 303, 'status=' . $r['status'] . ' body=' . snippet($r['body']));
 
